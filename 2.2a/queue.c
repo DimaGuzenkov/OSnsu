@@ -40,6 +40,12 @@ queue_t* queue_init(int max_count) {
 		abort();
 	}
 
+	if (pthread_spin_init(&q->lock, PTHREAD_PROCESS_PRIVATE) != 0) {
+        printf("Cannot initialize spinlock\n");
+        free(q);
+        abort();
+    }
+
 	return q;
 }
 
@@ -48,6 +54,8 @@ void queue_destroy(queue_t *q) {
     
     pthread_cancel(q->qmonitor_tid);
     pthread_join(q->qmonitor_tid, NULL);
+    
+    pthread_spin_destroy(&q->lock);
     
     qnode_t *current = q->first;
     while (current != NULL) {
@@ -60,53 +68,63 @@ void queue_destroy(queue_t *q) {
 }
 
 int queue_add(queue_t *q, int val) {
-	q->add_attempts++;
-
-	assert(q->count <= q->max_count);
-
-	if (q->count == q->max_count)
-		return 0;
-
-	qnode_t *new = malloc(sizeof(qnode_t));
-	if (!new) {
-		printf("Cannot allocate memory for new node\n");
-		abort();
-	}
-
-	new->val = val;
-	new->next = NULL;
-
-	if (!q->first)
-		q->first = q->last = new;
-	else {
-		q->last->next = new;
-		q->last = q->last->next;
-	}
-
-	q->count++;
-	q->add_count++;
-
-	return 1;
+    pthread_spin_lock(&q->lock);
+    
+    q->add_attempts++;
+    
+    assert(q->count <= q->max_count);
+    
+    if (q->count == q->max_count) {
+        pthread_spin_unlock(&q->lock);
+        return 0;
+    }
+    
+    qnode_t *new = malloc(sizeof(qnode_t));
+    if (!new) {
+        printf("Cannot allocate memory for new node\n");
+        pthread_spin_unlock(&q->lock);
+        abort();
+    }
+    
+    new->val = val;
+    new->next = NULL;
+    
+    if (!q->first)
+        q->first = q->last = new;
+    else {
+        q->last->next = new;
+        q->last = q->last->next;
+    }
+    
+    q->count++;
+    q->add_count++;
+    
+    pthread_spin_unlock(&q->lock);
+    return 1;
 }
 
 int queue_get(queue_t *q, int *val) {
-	q->get_attempts++;
-
-	assert(q->count >= 0);
-
-	if (q->count == 0)
-		return 0;
-
-	qnode_t *tmp = q->first;
-
-	*val = tmp->val;
-	q->first = q->first->next;
-
-	free(tmp);
-	q->count--;
-	q->get_count++;
-
-	return 1;
+    pthread_spin_lock(&q->lock);
+    
+    q->get_attempts++;
+    
+    assert(q->count >= 0);
+    
+    if (q->count == 0) {
+        pthread_spin_unlock(&q->lock);
+        return 0;
+    }
+    
+    qnode_t *tmp = q->first;
+    *val = tmp->val;
+    q->first = q->first->next;
+    
+    free(tmp);
+    q->count--;
+    q->get_count++;
+    
+    pthread_spin_unlock(&q->lock);
+    return 1;
 }
 
 void queue_print_stats(queue_t *q) {
