@@ -2,8 +2,26 @@
 #include <stdio.h>
 #include <unistd.h>
 
+void set_cpu(int n) {
+	int err;
+	cpu_set_t cpuset;
+	pthread_t tid = pthread_self();
+
+	CPU_ZERO(&cpuset);
+	CPU_SET(n, &cpuset);
+
+	err = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+	if (err) {
+		printf("set_cpu: pthread_setaffinity failed for cpu %d\n", n);
+		return;
+	}
+
+	printf("set_cpu: set cpu %d\n", n);
+}
+
 void* worker1(void *arg) {
     int id = *(int*)arg;
+    set_cpu(1);
     for (int i = 0; i < 5; i++) {
         printf("Поток %d: итерация %d\n", id, i);
         uthread_yield();
@@ -15,6 +33,7 @@ void* worker1(void *arg) {
 
 void* worker2(void *arg) {
     char *message = (char*)arg;
+    set_cpu(2);
     for (int i = 0; i < 3; i++) {
         printf("Поток '%s': работа %d\n", message, i);
         uthread_yield();

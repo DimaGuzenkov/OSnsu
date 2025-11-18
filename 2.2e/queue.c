@@ -110,9 +110,7 @@ int queue_get(queue_t *q, int *val) {
     pthread_mutex_lock(&q->lock);
     
     q->get_attempts++;
-    
-    assert(q->count >= 0);
-    
+        
     if (q->count == 0) {
         pthread_mutex_unlock(&q->lock);
         return 0;

@@ -94,8 +94,6 @@ int main() {
 		return -1;
 	}
 
-	// TODO: join threads
-
 	pthread_exit(NULL);
 
 	return 0;
