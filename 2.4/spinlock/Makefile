@@ -1,23 +1,23 @@
 CC = gcc
 CFLAGS = -Wall -pthread -D_GNU_SOURCE
-LDFLAGS = -lpthread
 TARGET = queue_spinlock_test
-SRCS = main.c queue.c spinlock.c
-OBJS = $(SRCS:.c=.o)
-HEADERS = queue.h spinlock.h
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+queue_spinlock_test: main.o queue.o spinlock.o
+	$(CC) $(CFLAGS) -o $@ main.o queue.o spinlock.o
 
-%.o: %.c $(HEADERS)
-	$(CC) $(CFLAGS) -c $< -o $@
+main.o: main.c queue.h spinlock.h
+	$(CC) $(CFLAGS) -c main.c
+
+queue.o: queue.c queue.h spinlock.h
+	$(CC) $(CFLAGS) -c queue.c
+
+spinlock.o: spinlock.c spinlock.h
+	$(CC) $(CFLAGS) -c spinlock.c
+
+clean:
+	rm -f $(TARGET) *.o
 
 run: $(TARGET)
 	./$(TARGET)
-
-clean:
-	rm -f $(TARGET) $(OBJS)
-
-.PHONY: all run clean
