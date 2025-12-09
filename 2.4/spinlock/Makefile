@@ -1,10 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -pthread -D_GNU_SOURCE
 LDFLAGS = -lpthread
-TARGET = queue_mutex_test
-SRCS = main.c queue.c mutex.c
+TARGET = queue_spinlock_test
+SRCS = main.c queue.c spinlock.c
 OBJS = $(SRCS:.c=.o)
-HEADERS = queue.h mutex.h futex.h
+HEADERS = queue.h spinlock.h
 
 all: $(TARGET)
 
