@@ -33,7 +33,6 @@ queue_t* queue_init(int max_count) {
     q->add_attempts = q->get_attempts = 0;
     q->add_count = q->get_count = 0;
 
-    // Инициализируем нашу блокировку
     LOCK_INIT(&q->lock);
 
     err = pthread_create(&q->qmonitor_tid, NULL, qmonitor, q);
@@ -51,9 +50,7 @@ void queue_destroy(queue_t *q) {
     
     pthread_cancel(q->qmonitor_tid);
     pthread_join(q->qmonitor_tid, NULL);
-    
-    // Блокировка не нужна при уничтожении
-    
+        
     qnode_t *current = q->first;
     while (current != NULL) {
         qnode_t *temp = current;
