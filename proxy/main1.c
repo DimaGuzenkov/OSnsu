@@ -30,6 +30,7 @@ typedef struct cache_entry {
 
     int complete;
     int cacheable;
+    size_t content_length;
 
     int refcount;
 
@@ -192,130 +193,17 @@ static cache_entry *cache_lookup(const char *url) {
     return NULL;
 }
 
-typedef struct {
-    char *data;
-    size_t size;
-    size_t capacity;
-    int complete;
-} client_buffer;
-
-static void process_http_response(int sock, cache_entry *e, int client_fd) {
-    char buf[CHUNK_SZ];
-    ssize_t r;
-    int headers_complete = 0;
-    size_t content_length = 0;
-    int chunked = 0;
-    char *body_start = NULL;
-    size_t header_len = 0;
-    
-    client_buffer client_buf = {0};
-    
-    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
-        if (!headers_complete) {
-            char *header_end = memmem(buf, r, "\r\n\r\n", 4);
-            if (header_end) {
-                headers_complete = 1;
-                header_len = header_end - buf + 4;
-                body_start = buf + header_len;
-                
-                char headers[CHUNK_SZ];
-                memcpy(headers, buf, header_len);
-                headers[header_len] = '\0';
-                
-                char *line = strtok(headers, "\r\n");
-                while (line) {
-                    if (strncasecmp(line, "Content-Length:", 15) == 0) {
-                        content_length = atol(line + 15);
-                        break;
-                    }
-                    line = strtok(NULL, "\r\n");
-                }
-                
-                if (content_length == 0) {
-                    log_fetcher(e->url, "No Content-Length header, cannot cache");
-                    e->cacheable = 0;
-                } else if (content_length > CACHE_MAX_BYTES) {
-                    log_fetcher(e->url, "File too large for cache, streaming directly");
-                    e->cacheable = 0;
-                } else {
-                    log_fetcher(e->url, "Content-Length found, attempting to cache");
-                    cache_evict_if_needed(content_length);
-                    
-                    pthread_mutex_lock(&cache_mem_lock);
-                    if (cache_used_bytes + content_length <= CACHE_MAX_BYTES) {
-                        e->data = malloc(content_length);
-                        e->capacity = content_length;
-                        cache_used_bytes += content_length;
-                        e->cacheable = 1;
-                        log_fetcher(e->url, "Memory allocated for caching");
-                    } else {
-                        e->cacheable = 0;
-                        log_fetcher(e->url, "Not enough cache space, streaming directly");
-                    }
-                    pthread_mutex_unlock(&cache_mem_lock);
-                }
-                
-                size_t body_bytes = r - header_len;
-                
-                if (e->cacheable && body_bytes > 0) {
-                    memcpy(e->data, body_start, body_bytes);
-                    e->size = body_bytes;
-                }
-                
-                if (!e->cacheable) {
-                    if (body_bytes > 0) {
-                        client_buf.data = malloc(body_bytes);
-                        memcpy(client_buf.data, body_start, body_bytes);
-                        client_buf.size = body_bytes;
-                        client_buf.capacity = body_bytes;
-                        send_all(client_fd, client_buf.data, client_buf.size);
-                        free(client_buf.data);
-                        client_buf.data = NULL;
-                        client_buf.size = 0;
-                    }
-                }
-            } else {
-                if (!e->cacheable) {
-                    send_all(client_fd, buf, r);
-                }
-            }
-        } else {
-            if (e->cacheable) {
-                if (e->size + r <= e->capacity) {
-                    memcpy(e->data + e->size, buf, r);
-                    e->size += r;
-                } else {
-                    log_fetcher(e->url, "Error: Received more data than expected");
-                    e->cacheable = 0;
-                    free(e->data);
-                    e->data = NULL;
-                    e->size = 0;
-                    e->capacity = 0;
-                    send_all(client_fd, buf, r);
-                }
-            } else {
-                send_all(client_fd, buf, r);
-            }
-        }
+static int extract_content_length(const char *headers, size_t headers_len) {
+    char *content_length_start = strstr(headers, "Content-Length:");
+    if (!content_length_start) {
+        content_length_start = strstr(headers, "Content-length:");
     }
     
-    if (e->cacheable && e->size == content_length) {
-        e->complete = 1;
-        log_cache(e->url, "STORED", e->size);
-        log_fetcher(e->url, "Fetch completed and cached successfully");
-    } else if (e->cacheable) {
-        log_fetcher(e->url, "Error: Incomplete data received, not caching");
-        pthread_mutex_lock(&cache_mem_lock);
-        cache_used_bytes -= e->capacity;
-        pthread_mutex_unlock(&cache_mem_lock);
-        free(e->data);
-        e->data = NULL;
-        e->size = 0;
-        e->capacity = 0;
-        e->cacheable = 0;
-    } else {
-        log_fetcher(e->url, "Fetch completed (not cached)");
+    if (!content_length_start) {
+        return -1;
     }
+    
+    return atoi(content_length_start + 15);
 }
 
 static void *fetcher_thread(void *arg) {
@@ -357,12 +245,102 @@ static void *fetcher_thread(void *arg) {
              "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
              path, host);
     send_all(sock, req, strlen(req));
+
+    char buf[CHUNK_SZ];
+    ssize_t r;
+    int headers_complete = 0;
+    size_t header_len = 0;
+    size_t total_received = 0;
     
-    int client_fd = -1;
-    
-    process_http_response(sock, e, client_fd);
+    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        pthread_mutex_lock(&e->lock);
+        
+        if (!headers_complete) {
+            char *header_end = memmem(buf, r, "\r\n\r\n", 4);
+            if (header_end) {
+                headers_complete = 1;
+                header_len = header_end - buf + 4;
+                
+                char headers[CHUNK_SZ];
+                memcpy(headers, buf, header_len);
+                headers[header_len] = '\0';
+                
+                int content_length = extract_content_length(headers, header_len);
+                if (content_length <= 0) {
+                    log_fetcher(e->url, "No Content-Length header or invalid value");
+                    e->cacheable = 0;
+                } else if (content_length > CACHE_MAX_BYTES) {
+                    log_fetcher(e->url, "File too large for cache");
+                    e->cacheable = 0;
+                } else {
+                    e->content_length = content_length;
+                    
+                    cache_evict_if_needed(content_length);
+                    
+                    pthread_mutex_lock(&cache_mem_lock);
+                    if (cache_used_bytes + content_length <= CACHE_MAX_BYTES) {
+                        e->data = malloc(content_length);
+                        e->capacity = content_length;
+                        cache_used_bytes += content_length;
+                        e->cacheable = 1;
+                        log_fetcher(e->url, "Memory allocated for caching");
+                    } else {
+                        e->cacheable = 0;
+                        log_fetcher(e->url, "Not enough cache space");
+                    }
+                    pthread_mutex_unlock(&cache_mem_lock);
+                }
+                
+                size_t body_bytes = r - header_len;
+                
+                if (e->cacheable && body_bytes > 0) {
+                    memcpy(e->data, buf + header_len, body_bytes);
+                    e->size = body_bytes;
+                    total_received = body_bytes;
+                }
+            }
+        } else {
+            if (e->cacheable) {
+                if (e->size + r <= e->capacity) {
+                    memcpy(e->data + e->size, buf, r);
+                    e->size += r;
+                    total_received += r;
+                    
+                    if (total_received % (CHUNK_SZ * 10) == 0) {
+                        log_fetcher(e->url, "Received chunk");
+                    }
+                } else {
+                    log_fetcher(e->url, "Error: Received more data than expected");
+                    e->cacheable = 0;
+                }
+            }
+        }
+        
+        pthread_cond_broadcast(&e->cond);
+        pthread_mutex_unlock(&e->lock);
+        
+        if (!e->cacheable) {
+            close(sock);
+            goto done;
+        }
+    }
 
     close(sock);
+
+    if (e->cacheable && e->size == e->content_length) {
+        log_cache(e->url, "STORED", e->size);
+        log_fetcher(e->url, "Fetch completed and cached successfully");
+    } else if (e->cacheable) {
+        log_fetcher(e->url, "Error: Incomplete data received");
+        pthread_mutex_lock(&cache_mem_lock);
+        cache_used_bytes -= e->capacity;
+        pthread_mutex_unlock(&cache_mem_lock);
+        free(e->data);
+        e->data = NULL;
+        e->size = 0;
+        e->capacity = 0;
+        e->cacheable = 0;
+    }
 
 done:
     pthread_mutex_lock(&e->lock);
@@ -372,23 +350,60 @@ done:
     return NULL;
 }
 
-static void send_data_to_client(int client_fd, cache_entry *e) {
-    const char *hdr = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
-    send_all(client_fd, hdr, strlen(hdr));
+static void handle_non_cacheable_request(int client_fd, const char *url) {
+    log_client("non-cacheable", 0, "Handling non-cacheable request");
     
-    if (e->cacheable && e->data) {
-        send_all(client_fd, e->data, e->size);
-    } else {
-        pthread_mutex_lock(&e->lock);
-        while (!e->complete || e->size == 0) {
-            pthread_cond_wait(&e->cond, &e->lock);
-        }
-        
-        if (e->data) {
-            send_all(client_fd, e->data, e->size);
-        }
-        pthread_mutex_unlock(&e->lock);
+    char host[MAX_HOST], port[MAX_PORT], path[MAX_URL];
+    if (parse_url(url, host, port, path) < 0) {
+        const char *err = "HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n";
+        send_all(client_fd, err, strlen(err));
+        return;
     }
+
+    struct addrinfo hints = {0}, *res;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        const char *err = "HTTP/1.0 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+        send_all(client_fd, err, strlen(err));
+        return;
+    }
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        freeaddrinfo(res);
+        close(sock);
+        const char *err = "HTTP/1.0 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+        send_all(client_fd, err, strlen(err));
+        return;
+    }
+    freeaddrinfo(res);
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             path, host);
+    send_all(sock, req, strlen(req));
+
+    char buf[CHUNK_SZ];
+    ssize_t r;
+    int headers_sent = 0;
+    
+    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        if (!headers_sent) {
+            char *header_end = memmem(buf, r, "\r\n\r\n", 4);
+            if (header_end) {
+                headers_sent = 1;
+                send_all(client_fd, buf, r);
+            } else {
+                send_all(client_fd, buf, r);
+            }
+        } else {
+            send_all(client_fd, buf, r);
+        }
+    }
+
+    close(sock);
 }
 
 static void *client_thread(void *arg) {
@@ -413,7 +428,11 @@ static void *client_thread(void *arg) {
     req[rr] = 0;
 
     char method[16], url[MAX_URL];
-    sscanf(req, "%15s %1023s", method, url);
+    if (sscanf(req, "%15s %1023s", method, url) != 2) {
+        log_client(client_ip, client_port, "Invalid request");
+        close(cfd);
+        return NULL;
+    }
     
     log_client(client_ip, client_port, url);
 
@@ -450,7 +469,23 @@ static void *client_thread(void *arg) {
         log_client(client_ip, client_port, "Using cached entry");
     }
 
-    send_data_to_client(cfd, e);
+    pthread_mutex_lock(&e->lock);
+    
+    while (!e->complete) {
+        pthread_cond_wait(&e->cond, &e->lock);
+    }
+    
+    if (e->cacheable && e->data && e->size > 0) {
+        pthread_mutex_unlock(&e->lock);
+        
+        const char *hdr = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
+        send_all(cfd, hdr, strlen(hdr));
+        send_all(cfd, e->data, e->size);
+    } else {
+        pthread_mutex_unlock(&e->lock);
+        
+        handle_non_cacheable_request(cfd, url);
+    }
 
     log_client(client_ip, client_port, "Request completed");
     close(cfd);
@@ -480,8 +515,15 @@ int main(int argc, char **argv) {
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = INADDR_ANY;
 
-    bind(s, (struct sockaddr*)&sa, sizeof(sa));
-    listen(s, 128);
+    if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("bind");
+        return 1;
+    }
+    
+    if (listen(s, 128) < 0) {
+        perror("listen");
+        return 1;
+    }
 
     log_time();
     printf("[SERVER] Starting proxy server on port %d\n", port);
