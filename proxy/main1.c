@@ -30,7 +30,6 @@ typedef struct cache_entry {
 
     int complete;
     int cacheable;
-    size_t content_length;
 
     int refcount;
 
@@ -182,7 +181,7 @@ static cache_entry *cache_lookup(const char *url) {
         if (strcmp(e->url, url) == 0) {
             e->refcount++;
             pthread_mutex_unlock(&cache_table_lock);
-            if (e->cacheable && e->complete) {
+            if (e->complete && e->cacheable) {
                 log_cache(url, "HIT", e->size);
             } else if (e->complete) {
                 log_cache(url, "HIT (NOT CACHEABLE)", e->size);
@@ -199,9 +198,8 @@ static cache_entry *cache_lookup(const char *url) {
     return NULL;
 }
 
-static int extract_content_length(char *headers, size_t headers_len) {
-    // Ищем Content-Length в заголовках
-    char *content_start = strstr(headers, "Content-Length:");
+static int extract_content_length(const char *headers) {
+    const char *content_start = strstr(headers, "Content-Length:");
     if (!content_start) {
         content_start = strstr(headers, "Content-length:");
     }
@@ -210,13 +208,11 @@ static int extract_content_length(char *headers, size_t headers_len) {
         return -1;
     }
     
-    // Пропускаем "Content-Length:" и пробелы
-    char *value_start = content_start + 15;
+    const char *value_start = content_start + 15;
     while (*value_start == ' ' || *value_start == '\t' || *value_start == ':') {
         value_start++;
     }
     
-    // Конвертируем в число
     return atoi(value_start);
 }
 
@@ -282,102 +278,87 @@ static void *fetcher_thread(void *arg) {
              path, host);
     send_all(sock, req, strlen(req));
 
-    char buf[CHUNK_SZ];
-    ssize_t r;
-    size_t total_received = 0;
+    // Сначала читаем заголовки, чтобы получить размер
+    char header_buf[CHUNK_SZ];
+    ssize_t header_bytes = 0;
+    int headers_complete = 0;
+    size_t content_length = 0;
+    size_t total_size = 0;
     
-    // Получаем первые данные, чтобы узнать размер
-    r = recv(sock, buf, sizeof(buf), 0);
-    if (r <= 0) {
-        log_fetcher(e->url, "No data received");
-        close(sock);
-        pthread_mutex_lock(&e->lock);
-        e->complete = 1;
-        e->cacheable = 0;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
-        return NULL;
-    }
-    
-    // Ищем конец заголовков
-    char *header_end = memmem(buf, r, "\r\n\r\n", 4);
-    if (!header_end) {
-        log_fetcher(e->url, "No end of headers found, cannot determine size");
-        close(sock);
-        pthread_mutex_lock(&e->lock);
-        e->complete = 1;
-        e->cacheable = 0;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
-        return NULL;
-    }
-    
-    // Извлекаем Content-Length из заголовков
-    char headers[CHUNK_SZ];
-    size_t header_len = header_end - buf + 4;
-    if (header_len >= sizeof(headers)) {
-        log_fetcher(e->url, "Headers too large");
-        close(sock);
-        pthread_mutex_lock(&e->lock);
-        e->complete = 1;
-        e->cacheable = 0;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
-        return NULL;
-    }
-    
-    memcpy(headers, buf, header_len);
-    headers[header_len] = '\0';
-    
-    int content_length = extract_content_length(headers, header_len);
-    if (content_length <= 0) {
-        log_fetcher(e->url, "No Content-Length header or invalid value");
-        close(sock);
-        pthread_mutex_lock(&e->lock);
-        e->complete = 1;
-        e->cacheable = 0;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
-        return NULL;
-    }
-    
-    // Общий размер = заголовки + тело
-    size_t total_size = header_len + content_length;
-    
-    if (total_size > CACHE_MAX_BYTES) {
-        log_fetcher(e->url, "File too large for cache");
-        close(sock);
-        pthread_mutex_lock(&e->lock);
-        e->complete = 1;
-        e->cacheable = 0;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
-        return NULL;
-    }
-    
-    // Выделяем память под весь ответ
-    cache_evict_if_needed(total_size);
-    
-    pthread_mutex_lock(&cache_mem_lock);
-    if (cache_used_bytes + total_size <= CACHE_MAX_BYTES) {
-        e->data = malloc(total_size);
-        if (!e->data) {
-            log_fetcher(e->url, "Failed to allocate memory");
-            e->cacheable = 0;
-        } else {
-            e->capacity = total_size;
-            cache_used_bytes += total_size;
-            e->cacheable = 1;
-            e->content_length = total_size;
-            log_fetcher(e->url, "Memory allocated for caching");
+    // Читаем пока не получим все заголовки
+    while (!headers_complete) {
+        ssize_t r = recv(sock, header_buf + header_bytes, sizeof(header_buf) - header_bytes, 0);
+        if (r <= 0) {
+            break;
         }
-    } else {
-        e->cacheable = 0;
-        log_fetcher(e->url, "Not enough cache space");
+        header_bytes += r;
+        
+        // Ищем конец заголовков
+        char *header_end = memmem(header_buf, header_bytes, "\r\n\r\n", 4);
+        if (header_end) {
+            headers_complete = 1;
+            size_t header_len = header_end - header_buf + 4;
+            
+            // Извлекаем Content-Length
+            char *headers = malloc(header_len + 1);
+            if (headers) {
+                memcpy(headers, header_buf, header_len);
+                headers[header_len] = '\0';
+                
+                int cl = extract_content_length(headers);
+                free(headers);
+                
+                if (cl <= 0) {
+                    log_fetcher(e->url, "No Content-Length header or invalid value");
+                    e->cacheable = 0;
+                } else {
+                    content_length = cl;
+                    total_size = header_len + content_length;
+                    
+                    if (total_size > CACHE_MAX_BYTES) {
+                        log_fetcher(e->url, "File too large for cache");
+                        e->cacheable = 0;
+                    } else {
+                        // Пытаемся выделить память
+                        cache_evict_if_needed(total_size);
+                        
+                        pthread_mutex_lock(&cache_mem_lock);
+                        if (cache_used_bytes + total_size <= CACHE_MAX_BYTES) {
+                            e->data = malloc(total_size);
+                            if (e->data) {
+                                e->capacity = total_size;
+                                cache_used_bytes += total_size;
+                                e->cacheable = 1;
+                                // Копируем заголовки
+                                memcpy(e->data, header_buf, header_len);
+                                e->size = header_len;
+                                log_fetcher(e->url, "Memory allocated for caching");
+                            } else {
+                                e->cacheable = 0;
+                                log_fetcher(e->url, "Failed to allocate memory");
+                            }
+                        } else {
+                            e->cacheable = 0;
+                            log_fetcher(e->url, "Not enough cache space");
+                        }
+                        pthread_mutex_unlock(&cache_mem_lock);
+                    }
+                }
+            }
+            
+            break;
+        }
+        
+        if (header_bytes >= sizeof(header_buf)) {
+            // Заголовки слишком большие
+            log_fetcher(e->url, "Headers too large");
+            e->cacheable = 0;
+            break;
+        }
     }
-    pthread_mutex_unlock(&cache_mem_lock);
     
     if (!e->cacheable) {
+        // Закрываем сокет, данные не кэшируются
         close(sock);
         pthread_mutex_lock(&e->lock);
         e->complete = 1;
@@ -386,45 +367,43 @@ static void *fetcher_thread(void *arg) {
         return NULL;
     }
     
-    // Копируем первые полученные данные
-    pthread_mutex_lock(&e->lock);
-    memcpy(e->data, buf, r);
-    e->size = r;
-    total_received = r;
-    pthread_cond_broadcast(&e->cond);
-    pthread_mutex_unlock(&e->lock);
+    // Если мы уже получили часть тела вместе с заголовками
+    if (header_bytes > e->size) {
+        size_t body_part = header_bytes - e->size;
+        if (body_part > 0 && e->size + body_part <= e->capacity) {
+            memcpy(e->data + e->size, header_buf + e->size, body_part);
+            e->size += body_part;
+            pthread_cond_broadcast(&e->cond);
+        }
+    }
     
-    // Получаем оставшиеся данные
-    while (total_received < total_size && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+    // Читаем остальные данные
+    char buf[CHUNK_SZ];
+    ssize_t r;
+    
+    while (e->size < e->capacity && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
         pthread_mutex_lock(&e->lock);
         
         if (e->size + r <= e->capacity) {
             memcpy(e->data + e->size, buf, r);
             e->size += r;
-            total_received += r;
-            
             pthread_cond_broadcast(&e->cond);
             pthread_mutex_unlock(&e->lock);
-            
-            if (total_received >= total_size) {
-                break;
-            }
         } else {
-            log_fetcher(e->url, "Error: Buffer overflow");
+            // Получили больше, чем ожидали
+            log_fetcher(e->url, "Received more data than expected");
             e->cacheable = 0;
             pthread_cond_broadcast(&e->cond);
             pthread_mutex_unlock(&e->lock);
             break;
         }
     }
-
+    
     close(sock);
-
-    if (e->cacheable && e->size == total_size) {
-        pthread_mutex_lock(&e->lock);
+    
+    pthread_mutex_lock(&e->lock);
+    if (e->cacheable && e->size == e->capacity) {
         e->complete = 1;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
         log_cache(e->url, "STORED", e->size);
         log_fetcher(e->url, "Fetch completed and cached successfully");
     } else if (e->cacheable) {
@@ -437,17 +416,14 @@ static void *fetcher_thread(void *arg) {
         e->size = 0;
         e->capacity = 0;
         e->cacheable = 0;
-        pthread_mutex_lock(&e->lock);
         e->complete = 1;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
     } else {
-        pthread_mutex_lock(&e->lock);
         e->complete = 1;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
     }
-
+    
+    pthread_cond_broadcast(&e->cond);
+    pthread_mutex_unlock(&e->lock);
+    
     return NULL;
 }
 
@@ -517,7 +493,7 @@ static void *client_thread(void *arg) {
         log_client(client_ip, client_port, "Creating new cache entry");
         e = calloc(1, sizeof(*e));
         strcpy(e->url, url);
-        e->cacheable = 1;  // Пытаемся кэшировать по умолчанию
+        e->cacheable = 1;  // Попытка кэшировать по умолчанию
         e->refcount = 1;
         pthread_mutex_init(&e->lock, NULL);
         pthread_cond_init(&e->cond, NULL);
@@ -542,10 +518,10 @@ static void *client_thread(void *arg) {
         pthread_create(&th, NULL, fetcher_thread, e);
         pthread_detach(th);
     } else {
-        if (e->cacheable && e->complete) {
+        if (e->complete && e->cacheable) {
             log_client(client_ip, client_port, "Using cached entry");
         } else if (e->complete) {
-            log_client(client_ip, client_port, "Entry not cacheable, streaming directly");
+            log_client(client_ip, client_port, "Entry not cacheable");
         } else {
             log_client(client_ip, client_port, "Waiting for download to complete");
         }
@@ -565,11 +541,10 @@ static void *client_thread(void *arg) {
     pthread_mutex_unlock(&e->lock);
     
     if (cacheable && cached_data && cached_size > 0) {
-        log_client(client_ip, client_port, "Sending from cache");
-        // Отправляем весь кэшированный ответ (включая заголовки)
+        // Отправляем весь кэшированный ответ
         send_all(cfd, cached_data, cached_size);
     } else {
-        log_client(client_ip, client_port, "Streaming directly (not cached)");
+        // Прямой стриминг
         stream_directly(cfd, url);
     }
 
