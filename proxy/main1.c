@@ -203,13 +203,22 @@ static int extract_content_length(const char *headers) {
         return -1;
     }
     
-    char *end = strchr(content_length_start, '\r');
-    if (!end) end = strchr(content_length_start, '\n');
+    // Skip "Content-Length:"
+    char *value_start = content_length_start + 15;
+    // Skip spaces
+    while (*value_start == ' ' || *value_start == '\t') {
+        value_start++;
+    }
+    
+    // Find end of value
+    char *end = strchr(value_start, '\r');
+    if (!end) end = strchr(value_start, '\n');
     if (!end) return -1;
     
+    // Extract value
     char length_str[32];
-    strncpy(length_str, content_length_start + 15, end - (content_length_start + 15));
-    length_str[end - (content_length_start + 15)] = '\0';
+    strncpy(length_str, value_start, end - value_start);
+    length_str[end - value_start] = '\0';
     
     return atoi(length_str);
 }
@@ -217,12 +226,18 @@ static int extract_content_length(const char *headers) {
 static int connect_to_server(const char *host, const char *port) {
     struct addrinfo hints = {0}, *res;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
 
     if (getaddrinfo(host, port, &hints, &res) != 0) {
         return -1;
     }
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+    
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         freeaddrinfo(res);
         close(sock);
@@ -263,11 +278,10 @@ static void *fetcher_thread(void *arg) {
     char buf[CHUNK_SZ];
     ssize_t r;
     int headers_complete = 0;
-    size_t total_received = 0;
-    char *body_start = NULL;
     size_t header_len = 0;
+    int content_length = 0;
     
-    // First, read headers to get content length
+    // Read headers first
     while (!headers_complete && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
         char *header_end = memmem(buf, r, "\r\n\r\n", 4);
         if (header_end) {
@@ -275,19 +289,25 @@ static void *fetcher_thread(void *arg) {
             header_len = header_end - buf + 4;
             
             // Parse headers to get content length
-            char headers[CHUNK_SZ];
-            memcpy(headers, buf, header_len);
-            headers[header_len] = '\0';
+            char *headers_copy = malloc(header_len + 1);
+            if (!headers_copy) {
+                log_fetcher(e->url, "Failed to allocate memory for headers");
+                e->cacheable = 0;
+                close(sock);
+                goto done;
+            }
+            memcpy(headers_copy, buf, header_len);
+            headers_copy[header_len] = '\0';
             
-            int content_length = extract_content_length(headers);
+            content_length = extract_content_length(headers_copy);
+            free(headers_copy);
+            
             if (content_length <= 0) {
                 log_fetcher(e->url, "No Content-Length header or invalid value, cannot cache");
                 e->cacheable = 0;
                 close(sock);
                 goto done;
             }
-            
-            e->content_length = content_length;
             
             if (content_length > CACHE_MAX_BYTES) {
                 log_fetcher(e->url, "File too large for cache");
@@ -305,6 +325,7 @@ static void *fetcher_thread(void *arg) {
                 e->capacity = content_length;
                 cache_used_bytes += content_length;
                 e->cacheable = 1;
+                e->content_length = content_length;
                 log_fetcher(e->url, "Memory allocated for caching");
             } else {
                 e->cacheable = 0;
@@ -320,9 +341,20 @@ static void *fetcher_thread(void *arg) {
             // Copy body part after headers
             size_t body_bytes = r - header_len;
             if (body_bytes > 0) {
+                pthread_mutex_lock(&e->lock);
                 memcpy(e->data, buf + header_len, body_bytes);
                 e->size = body_bytes;
-                total_received = body_bytes;
+                pthread_cond_broadcast(&e->cond);
+                pthread_mutex_unlock(&e->lock);
+            }
+            
+            // If we got everything in first chunk
+            if (body_bytes == content_length) {
+                e->complete = 1;
+                close(sock);
+                log_cache(e->url, "STORED", e->size);
+                log_fetcher(e->url, "Fetch completed in first chunk");
+                goto done;
             }
         }
     }
@@ -335,13 +367,13 @@ static void *fetcher_thread(void *arg) {
             if (e->size + r <= e->capacity) {
                 memcpy(e->data + e->size, buf, r);
                 e->size += r;
-                total_received += r;
-                
-                if (total_received % (CHUNK_SZ * 10) == 0) {
-                    log_fetcher(e->url, "Received chunk");
-                }
                 
                 pthread_cond_broadcast(&e->cond);
+                pthread_mutex_unlock(&e->lock);
+                
+                if (e->size == e->content_length) {
+                    break; // Got everything
+                }
             } else {
                 log_fetcher(e->url, "Error: Received more data than expected");
                 e->cacheable = 0;
@@ -349,14 +381,13 @@ static void *fetcher_thread(void *arg) {
                 pthread_mutex_unlock(&e->lock);
                 break;
             }
-            
-            pthread_mutex_unlock(&e->lock);
         }
     }
 
     close(sock);
 
     if (e->cacheable && e->size == e->content_length) {
+        e->complete = 1;
         log_cache(e->url, "STORED", e->size);
         log_fetcher(e->url, "Fetch completed and cached successfully");
     } else if (e->cacheable) {
@@ -373,7 +404,7 @@ static void *fetcher_thread(void *arg) {
 
 done:
     pthread_mutex_lock(&e->lock);
-    e->complete = 1;
+    if (!e->complete) e->complete = 1;
     pthread_cond_broadcast(&e->cond);
     pthread_mutex_unlock(&e->lock);
     return NULL;
