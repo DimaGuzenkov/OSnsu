@@ -9,26 +9,22 @@
 #define MAX_STRING_LEN 100
 #define SWAP_PROBABILITY 50
 
-// Глобальные счетчики
 volatile long long iterations[3] = {0};
 volatile long long swap_attempts = 0;
 volatile long long swap_success = 0;
 
-// Узел списка
 typedef struct _Node {
     char value[MAX_STRING_LEN];
     struct _Node* next;
     pthread_mutex_t sync;
 } Node;
 
-// Хранилище
 typedef struct _Storage {
     Node *first;
     pthread_rwlock_t rwlock;
     int size;
 } Storage;
 
-// Инициализация
 Storage* storage_create() {
     Storage* s = (Storage*)malloc(sizeof(Storage));
     s->first = NULL;
@@ -44,6 +40,23 @@ Node* node_create(const char* value) {
     n->next = NULL;
     pthread_mutex_init(&n->sync, NULL);
     return n;
+}
+
+void set_cpu(int n) {
+	int err;
+	cpu_set_t cpuset;
+	pthread_t tid = pthread_self();
+
+	CPU_ZERO(&cpuset);
+	CPU_SET(n, &cpuset);
+
+	err = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+	if (err) {
+		printf("set_cpu: pthread_setaffinity failed for cpu %d\n", n);
+		return;
+	}
+
+	printf("set_cpu: set cpu %d\n", n);
 }
 
 void storage_add(Storage* s, const char* value) {
@@ -71,31 +84,29 @@ void generate_random_string(char* buffer, int min_len, int max_len) {
     buffer[len] = '\0';
 }
 
-// ПОТОКИ ПОДСЧЕТА (корректные - одна пара за итерацию)
 void* count_increasing(void* arg) {
     Storage* s = (Storage*)arg;
-    static __thread int current_index = 0;  // Текущая позиция в списке
+    static __thread int current_index = 0;
+
+    set_cpu(1);
     
     while (1) {
         pthread_rwlock_rdlock(&s->rwlock);
         
-        // Если список слишком мал
         if (s->size < 2) {
             pthread_rwlock_unlock(&s->rwlock);
             usleep(10);
             continue;
         }
         
-        // Если дошли до конца списка
         if (current_index >= s->size - 1) {
             pthread_rwlock_unlock(&s->rwlock);
-            iterations[0]++;  // Инкрементируем счетчик проходов
-            current_index = 0;  // Начинаем с начала
+            iterations[0]++;
+            current_index = 0;
             usleep(10);
             continue;
         }
         
-        // Находим текущую пару по индексу
         Node* prev = s->first;
         for (int i = 0; i < current_index && prev != NULL; i++) {
             prev = prev->next;
@@ -110,23 +121,17 @@ void* count_increasing(void* arg) {
         
         Node* curr = prev->next;
         
-        // Захватываем мьютексы узлов
         pthread_mutex_lock(&prev->sync);
         pthread_mutex_lock(&curr->sync);
         
-        // Можем отпустить rwlock
         pthread_rwlock_unlock(&s->rwlock);
         
-        // Проверяем условие (возрастание)
         if (strlen(prev->value) < strlen(curr->value)) {
-            // Можно что-то сделать, но в задании просто считаем итерации
         }
         
-        // Освобождаем мьютексы
         pthread_mutex_unlock(&curr->sync);
         pthread_mutex_unlock(&prev->sync);
         
-        // Переходим к следующей паре
         current_index++;
         
         usleep(10);
@@ -138,6 +143,8 @@ void* count_increasing(void* arg) {
 void* count_decreasing(void* arg) {
     Storage* s = (Storage*)arg;
     static __thread int current_index = 0;
+
+    set_cpu(1);
     
     while (1) {
         pthread_rwlock_rdlock(&s->rwlock);
@@ -176,7 +183,6 @@ void* count_decreasing(void* arg) {
         pthread_rwlock_unlock(&s->rwlock);
         
         if (strlen(prev->value) > strlen(curr->value)) {
-            // Проверка условия
         }
         
         pthread_mutex_unlock(&curr->sync);
@@ -193,6 +199,8 @@ void* count_decreasing(void* arg) {
 void* count_equal(void* arg) {
     Storage* s = (Storage*)arg;
     static __thread int current_index = 0;
+
+    set_cpu(1);
     
     while (1) {
         pthread_rwlock_rdlock(&s->rwlock);
@@ -231,7 +239,6 @@ void* count_equal(void* arg) {
         pthread_rwlock_unlock(&s->rwlock);
         
         if (strlen(prev->value) == strlen(curr->value)) {
-            // Проверка условия
         }
         
         pthread_mutex_unlock(&curr->sync);
@@ -245,18 +252,18 @@ void* count_equal(void* arg) {
     return NULL;
 }
 
-// ПОТОКИ ПЕРЕСТАНОВКИ (одна пара за итерацию)
 void* swap_thread(void* arg) {
     Storage* s = (Storage*)arg;
     static __thread unsigned int seed = 0;
     static __thread int current_index = 0;
+
+    set_cpu(2);
     
     if (seed == 0) seed = time(NULL) ^ pthread_self();
     
     while (1) {
         __sync_fetch_and_add(&swap_attempts, 1);
         
-        // Решаем случайно, будем ли менять
         bool should_swap = (rand_r(&seed) % 100) < SWAP_PROBABILITY;
         
         if (!should_swap) {
@@ -273,11 +280,9 @@ void* swap_thread(void* arg) {
             continue;
         }
         
-        // Определяем текущую пару
         int pair_index = current_index % (s->size - 1);
         current_index = (current_index + 1) % (s->size - 1);
         
-        // Находим узлы
         Node* prev = NULL;
         Node* curr = s->first;
         
@@ -293,7 +298,6 @@ void* swap_thread(void* arg) {
         
         Node* next = curr->next;
         
-        // Выполняем перестановку
         if (prev == NULL) {
             s->first = next;
         } else {
@@ -313,7 +317,6 @@ void* swap_thread(void* arg) {
     return NULL;
 }
 
-// Статистика
 void* stats_thread(void* arg) {
     long long last_iterations[3] = {0};
     long long last_swap_attempts = 0;
@@ -376,19 +379,16 @@ int main(int argc, char* argv[]) {
     }
     printf("Список создан. Размер: %d\n", storage->size);
     
-    // Создаем потоки
     pthread_t counter_threads[3];
     pthread_t swap_threads[3];
     pthread_t stats_thread_id;
     
     printf("Запуск потоков...\n");
     
-    // Запускаем потоки подсчета
     pthread_create(&counter_threads[0], NULL, count_increasing, storage);
     pthread_create(&counter_threads[1], NULL, count_decreasing, storage);
     pthread_create(&counter_threads[2], NULL, count_equal, storage);
     
-    // Запускаем потоки перестановки
     for (int i = 0; i < 3; i++) {
         pthread_create(&swap_threads[i], NULL, swap_thread, storage);
     }

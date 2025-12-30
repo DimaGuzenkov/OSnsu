@@ -1,0 +1,343 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <time.h>
+#include <limits.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define MAX_URL 1024
+#define MAX_HOST 256
+#define MAX_PORT 16
+#define CHUNK_SZ 8192
+
+#define CACHE_MAX_BYTES (20 * 1024 * 1024)
+#define CACHE_TTL_SEC   5
+
+typedef struct cache_entry {
+    char url[MAX_URL];
+
+    char *data;
+    size_t size;
+    size_t capacity;
+
+    int complete;
+    int cacheable;
+
+    int refcount;
+    time_t expire_at;
+
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+
+    struct cache_entry *next;
+} cache_entry;
+
+/* ================= GLOBAL CACHE ================= */
+
+static cache_entry *cache_table = NULL;
+static pthread_mutex_t cache_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t cache_used_bytes = 0;
+static pthread_mutex_t cache_mem_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ================= HELPERS ================= */
+
+static int send_all(int fd, const void *buf, size_t len) {
+    size_t off = 0;
+    const char *p = buf;
+    while (off < len) {
+        ssize_t s = send(fd, p + off, len - off, 0);
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)s;
+    }
+    return 0;
+}
+
+/* ================= URL PARSER ================= */
+
+static int parse_url(const char *url, char *host, char *port, char *path) {
+    const char *p = strstr(url, "://");
+    if (!p) return -1;
+    p += 3;
+
+    const char *slash = strchr(p, '/');
+    if (!slash) return -1;
+
+    const char *colon = memchr(p, ':', slash - p);
+    if (colon) {
+        snprintf(host, MAX_HOST, "%.*s", (int)(colon - p), p);
+        snprintf(port, MAX_PORT, "%.*s", (int)(slash - colon - 1), colon + 1);
+    } else {
+        snprintf(host, MAX_HOST, "%.*s", (int)(slash - p), p);
+        strcpy(port, "80");
+    }
+    snprintf(path, MAX_URL, "%s", slash);
+    return 0;
+}
+
+/* ================= CACHE EVICTION ================= */
+
+static void cache_remove_entry(cache_entry *e) {
+    cache_entry **pp = &cache_table;
+    while (*pp && *pp != e)
+        pp = &(*pp)->next;
+    if (*pp) *pp = e->next;
+
+    pthread_mutex_lock(&cache_mem_lock);
+    cache_used_bytes -= e->capacity;
+    pthread_mutex_unlock(&cache_mem_lock);
+
+    printf("[CACHE FREE] %s (%zu bytes)\n", e->url, e->capacity);
+
+    free(e->data);
+    pthread_mutex_destroy(&e->lock);
+    pthread_cond_destroy(&e->cond);
+    free(e);
+}
+
+static void cache_evict_if_needed(size_t needed) {
+    while (1) {
+        pthread_mutex_lock(&cache_mem_lock);
+        size_t available = CACHE_MAX_BYTES - cache_used_bytes;
+        pthread_mutex_unlock(&cache_mem_lock);
+
+        if (available >= needed)
+            return;
+
+        cache_entry *victim = NULL;
+        time_t oldest = LONG_MAX;
+
+        pthread_mutex_lock(&cache_table_lock);
+        for (cache_entry *e = cache_table; e; e = e->next) {
+            if (e->complete && e->refcount == 0 && e->expire_at < oldest) {
+                oldest = e->expire_at;
+                victim = e;
+            }
+        }
+
+        if (!victim) {
+            pthread_mutex_unlock(&cache_table_lock);
+            return;
+        }
+
+        cache_remove_entry(victim);
+        pthread_mutex_unlock(&cache_table_lock);
+    }
+}
+
+/* ================= CACHE LOOKUP ================= */
+
+static cache_entry *cache_lookup(const char *url) {
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&cache_table_lock);
+
+    cache_entry *prev = NULL;
+    cache_entry *e = cache_table;
+
+    while (e) {
+        if (strcmp(e->url, url) == 0) {
+            if (e->expire_at && e->expire_at < now) {
+                cache_entry *dead = e;
+                if (prev) prev->next = e->next;
+                else cache_table = e->next;
+                e = e->next;
+                cache_remove_entry(dead);
+                continue;
+            }
+            e->refcount++;
+            pthread_mutex_unlock(&cache_table_lock);
+            printf("[CACHE HIT] %s\n", url);
+            return e;
+        }
+        prev = e;
+        e = e->next;
+    }
+
+    pthread_mutex_unlock(&cache_table_lock);
+    return NULL;
+}
+
+/* ================= FETCHER ================= */
+
+static void *fetcher_thread(void *arg) {
+    cache_entry *e = arg;
+
+    char host[MAX_HOST], port[MAX_PORT], path[MAX_URL];
+    if (parse_url(e->url, host, port, path) < 0)
+        goto done;
+
+    struct addrinfo hints = {0}, *res;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0)
+        goto done;
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        freeaddrinfo(res);
+        close(sock);
+        goto done;
+    }
+    freeaddrinfo(res);
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             path, host);
+    send_all(sock, req, strlen(req));
+
+    char buf[CHUNK_SZ];
+    ssize_t r;
+
+    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        pthread_mutex_lock(&e->lock);
+
+        if (e->cacheable) {
+            if (e->size + r > e->capacity) {
+                size_t newcap = e->capacity ? e->capacity * 2 : 16384;
+                while (newcap < e->size + r)
+                    newcap *= 2;
+
+                cache_evict_if_needed(newcap - e->capacity);
+
+                pthread_mutex_lock(&cache_mem_lock);
+                if (cache_used_bytes + (newcap - e->capacity) <= CACHE_MAX_BYTES) {
+                    cache_used_bytes += (newcap - e->capacity);
+                    e->data = realloc(e->data, newcap);
+                    e->capacity = newcap;
+                } else {
+                    e->cacheable = 0;
+                }
+                pthread_mutex_unlock(&cache_mem_lock);
+            }
+
+            if (e->cacheable) {
+                memcpy(e->data + e->size, buf, r);
+                e->size += r;
+            }
+        }
+
+        pthread_cond_broadcast(&e->cond);
+        pthread_mutex_unlock(&e->lock);
+    }
+
+    close(sock);
+
+done:
+    pthread_mutex_lock(&e->lock);
+    e->complete = 1;
+    e->expire_at = time(NULL) + CACHE_TTL_SEC;
+    pthread_cond_broadcast(&e->cond);
+    pthread_mutex_unlock(&e->lock);
+    return NULL;
+}
+
+/* ================= CLIENT ================= */
+
+static void *client_thread(void *arg) {
+    int cfd = (intptr_t)arg;
+    char req[4096];
+
+    ssize_t rr = recv(cfd, req, sizeof(req) - 1, 0);
+    if (rr <= 0) {
+        close(cfd);
+        return NULL;
+    }
+    req[rr] = 0;
+
+    char method[16], url[MAX_URL];
+    sscanf(req, "%15s %1023s", method, url);
+
+    cache_entry *e = cache_lookup(url);
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        strcpy(e->url, url);
+        e->cacheable = 1;
+        e->refcount = 1;
+        pthread_mutex_init(&e->lock, NULL);
+        pthread_cond_init(&e->cond, NULL);
+
+        pthread_mutex_lock(&cache_table_lock);
+        e->next = cache_table;
+        cache_table = e;
+        pthread_mutex_unlock(&cache_table_lock);
+
+        pthread_t th;
+        pthread_create(&th, NULL, fetcher_thread, e);
+        pthread_detach(th);
+    }
+
+    const char *hdr = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
+    send_all(cfd, hdr, strlen(hdr));
+
+    size_t offset = 0;
+    while (1) {
+        pthread_mutex_lock(&e->lock);
+        while (!e->complete && offset >= e->size)
+            pthread_cond_wait(&e->cond, &e->lock);
+
+        size_t avail = e->size - offset;
+        int done = e->complete && offset >= e->size;
+        pthread_mutex_unlock(&e->lock);
+
+        if (avail > 0) {
+            if (send_all(cfd, e->data + offset, avail) < 0)
+                break;
+            offset += avail;
+        }
+        if (done)
+            break;
+    }
+
+    close(cfd);
+
+    pthread_mutex_lock(&e->lock);
+    e->refcount--;
+    pthread_mutex_unlock(&e->lock);
+
+    return NULL;
+}
+
+/* ================= MAIN ================= */
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+
+    int port = atoi(argv[1]);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = INADDR_ANY;
+
+    bind(s, (struct sockaddr*)&sa, sizeof(sa));
+    listen(s, 128);
+
+    printf("Listening on port %d\n", port);
+
+    while (1) {
+        int cfd = accept(s, NULL, NULL);
+        pthread_t th;
+        pthread_create(&th, NULL, client_thread, (void*)(intptr_t)cfd);
+        pthread_detach(th);
+    }
+}
+
