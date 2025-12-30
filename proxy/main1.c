@@ -371,7 +371,7 @@ static void *fetcher_thread(void *arg) {
                     pthread_mutex_lock(&e->lock);
                     e->complete = 1;
                     pthread_cond_broadcast(&e->cond);
-                    pthread_mutex_unlock(e->lock);
+                    pthread_mutex_unlock(&e->lock);
                     break;
                 }
             } else {
