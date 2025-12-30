@@ -156,7 +156,6 @@ static void cache_evict_if_needed(size_t needed) {
         pthread_mutex_lock(&cache_table_lock);
         for (cache_entry *e = cache_table; e; e = e->next) {
             if (e->complete && e->refcount == 0) {
-                // Выбираем первую попавшуюся неиспользуемую запись для удаления
                 victim = e;
                 break;
             }
@@ -195,6 +194,88 @@ static cache_entry *cache_lookup(const char *url) {
     pthread_mutex_unlock(&cache_table_lock);
     log_cache(url, "MISS", 0);
     return NULL;
+}
+
+/* ================= DIRECT FETCH FUNCTION ================= */
+
+static int direct_fetch_to_client(const char *url, int client_fd) {
+    log_fetcher(url, "Starting direct fetch to client");
+
+    char host[MAX_HOST], port[MAX_PORT], path[MAX_URL];
+    if (parse_url(url, host, port, path) < 0) {
+        log_fetcher(url, "Failed to parse URL");
+        return -1;
+    }
+
+    log_connection(host, atoi(port), "Resolving address for direct fetch");
+
+    struct addrinfo hints = {0}, *res;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        log_connection(host, atoi(port), "DNS resolution failed");
+        return -1;
+    }
+
+    log_connection(host, atoi(port), "Creating socket for direct fetch");
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        log_connection(host, atoi(port), "Socket creation failed");
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        log_connection(host, atoi(port), "Connection failed");
+        freeaddrinfo(res);
+        close(sock);
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    log_connection(host, atoi(port), "Connected, sending request");
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             path, host);
+    
+    if (send_all(sock, req, strlen(req)) < 0) {
+        log_connection(host, atoi(port), "Request send failed");
+        close(sock);
+        return -1;
+    }
+
+    char buf[CHUNK_SZ];
+    ssize_t r;
+    size_t total_received = 0;
+
+    log_fetcher(url, "Starting to stream data to client");
+
+    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        total_received += r;
+        
+        if (send_all(client_fd, buf, r) < 0) {
+            log_fetcher(url, "Failed to send data to client");
+            close(sock);
+            return -1;
+        }
+        
+        if (total_received % (CHUNK_SZ * 10) == 0) {
+            log_fetcher(url, "Streamed chunk to client");
+        }
+    }
+
+    close(sock);
+    
+    if (r < 0) {
+        log_fetcher(url, "Error reading from server");
+        return -1;
+    }
+
+    log_fetcher(url, "Direct fetch completed successfully");
+    return 0;
 }
 
 
@@ -261,7 +342,15 @@ static void *fetcher_thread(void *arg) {
                     e->capacity = newcap;
                     log_fetcher(e->url, "Cache expanded successfully");
                 } else {
+                    /* Не хватило места в кэше - отключаем кэширование и освобождаем память */
                     e->cacheable = 0;
+                    if (e->data) {
+                        cache_used_bytes -= e->capacity;
+                        free(e->data);
+                        e->data = NULL;
+                        e->size = 0;
+                        e->capacity = 0;
+                    }
                     log_fetcher(e->url, "Cache full, disabling caching for this entry");
                 }
                 pthread_mutex_unlock(&cache_mem_lock);
@@ -288,7 +377,7 @@ done:
     pthread_mutex_lock(&e->lock);
     e->complete = 1;
     
-    if (e->cacheable) {
+    if (e->cacheable && e->data) {
         log_cache(e->url, "STORED", e->size);
         log_fetcher(e->url, "Fetch completed successfully");
     } else {
@@ -329,6 +418,18 @@ static void *client_thread(void *arg) {
 
     cache_entry *e = cache_lookup(url);
     if (!e) {
+        /* Проверяем, есть ли место в кэше для нового элемента */
+        pthread_mutex_lock(&cache_mem_lock);
+        int cache_has_space = (cache_used_bytes < CACHE_MAX_BYTES);
+        pthread_mutex_unlock(&cache_mem_lock);
+        
+        if (!cache_has_space) {
+            log_client(client_ip, client_port, "Cache full, using direct fetch");
+            direct_fetch_to_client(url, cfd);
+            close(cfd);
+            return NULL;
+        }
+        
         log_client(client_ip, client_port, "Creating new cache entry");
         e = calloc(1, sizeof(*e));
         strcpy(e->url, url);
@@ -360,13 +461,28 @@ static void *client_thread(void *arg) {
         log_client(client_ip, client_port, "Using cached entry");
     }
 
-    const char *hdr = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
-    send_all(cfd, hdr, strlen(hdr));
-
     size_t offset = 0;
     size_t total_sent = 0;
     while (1) {
         pthread_mutex_lock(&e->lock);
+        
+        /* Если кэширование отключено и данных нет, нужно перейти на прямую пересылку */
+        if (!e->cacheable && !e->complete && offset == 0) {
+            pthread_mutex_unlock(&e->lock);
+            
+            log_client(client_ip, client_port, "Switching to direct fetch (cache disabled)");
+            
+            /* Уменьшаем счетчик ссылок перед переходом на прямую пересылку */
+            pthread_mutex_lock(&e->lock);
+            e->refcount--;
+            pthread_mutex_unlock(&e->lock);
+            
+            /* Выполняем прямую пересылку */
+            direct_fetch_to_client(url, cfd);
+            close(cfd);
+            return NULL;
+        }
+        
         while (!e->complete && offset >= e->size)
             pthread_cond_wait(&e->cond, &e->lock);
 
