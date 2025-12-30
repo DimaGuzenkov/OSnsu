@@ -11,15 +11,15 @@
 #define SWAP_PROBABILITY 50
 
 // Глобальные счетчики (атомарные для потокобезопасности)
-atomic_long long total_passes = 0;
-atomic_long long increase_passes = 0;
-atomic_long long decrease_passes = 0;
-atomic_long long equal_passes = 0;
-atomic_long long total_comparisons = 0;
-atomic_long long total_swaps = 0;
-atomic_long long increase_count = 0;
-atomic_long long decrease_count = 0;
-atomic_long long equal_count = 0;
+atomic_long total_passes = 0;
+atomic_long increase_passes = 0;
+atomic_long decrease_passes = 0;
+atomic_long equal_passes = 0;
+atomic_long total_comparisons = 0;
+atomic_long total_swaps = 0;
+atomic_long increase_count = 0;
+atomic_long decrease_count = 0;
+atomic_long equal_count = 0;
 
 volatile bool cancel = false;
 
@@ -130,7 +130,7 @@ void* increases_thread(void* arg) {
         Node* second = first->next;
         if (second == NULL) {
             unlock_node(first);
-            increase_passes++;
+            atomic_fetch_add(&increase_passes, 1);
             continue;
         }
         
@@ -190,7 +190,7 @@ void* decreases_thread(void* arg) {
         Node* second = first->next;
         if (second == NULL) {
             unlock_node(first);
-            decrease_passes++;
+            atomic_fetch_add(&decrease_passes, 1);
             continue;
         }
         
@@ -246,7 +246,7 @@ void* equal_thread(void* arg) {
         Node* second = first->next;
         if (second == NULL) {
             unlock_node(first);
-            equal_passes++;
+            atomic_fetch_add(&equal_passes, 1);
             continue;
         }
         
@@ -342,7 +342,9 @@ void* swap_thread(void* arg) {
             // Случайно решаем, менять ли current и next
             if (rand_r(&seed) % 100 < SWAP_PROBABILITY) {
                 // Меняем current и next
-                swap_nodes(prev, current, next);
+                prev->next = next;
+                current->next = next->next;
+                next->next = current;
                 atomic_fetch_add(&total_swaps, 1);
                 
                 // После обмена current и next поменялись местами
@@ -358,8 +360,6 @@ void* swap_thread(void* arg) {
             prev = current;
             current = next;
             next = new_next;
-            
-            // Не блокируем next если он NULL
         }
         
         // Разблокируем последние узлы
