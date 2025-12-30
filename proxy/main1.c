@@ -193,34 +193,25 @@ static cache_entry *cache_lookup(const char *url) {
     return NULL;
 }
 
-static int extract_content_length(const char *headers) {
-    char *content_length_start = strstr(headers, "Content-Length:");
-    if (!content_length_start) {
-        content_length_start = strstr(headers, "Content-length:");
+static int extract_content_length(char *headers, size_t headers_len) {
+    // Ищем Content-Length в заголовках
+    char *content_start = strstr(headers, "Content-Length:");
+    if (!content_start) {
+        content_start = strstr(headers, "Content-length:");
     }
     
-    if (!content_length_start) {
+    if (!content_start) {
         return -1;
     }
     
-    // Skip "Content-Length:"
-    char *value_start = content_length_start + 15;
-    // Skip spaces
-    while (*value_start == ' ' || *value_start == '\t') {
+    // Пропускаем "Content-Length:" и пробелы
+    char *value_start = content_start + 15;
+    while (*value_start == ' ' || *value_start == '\t' || *value_start == ':') {
         value_start++;
     }
     
-    // Find end of value
-    char *end = strchr(value_start, '\r');
-    if (!end) end = strchr(value_start, '\n');
-    if (!end) return -1;
-    
-    // Extract value
-    char length_str[32];
-    strncpy(length_str, value_start, end - value_start);
-    length_str[end - value_start] = '\0';
-    
-    return atoi(length_str);
+    // Конвертируем в число
+    return atoi(value_start);
 }
 
 static int connect_to_server(const char *host, const char *port) {
@@ -279,87 +270,87 @@ static void *fetcher_thread(void *arg) {
     ssize_t r;
     int headers_complete = 0;
     size_t header_len = 0;
-    int content_length = 0;
+    size_t total_received = 0;
     
-    // Read headers first
+    // Читаем ответ, находим заголовки
     while (!headers_complete && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
         char *header_end = memmem(buf, r, "\r\n\r\n", 4);
         if (header_end) {
             headers_complete = 1;
             header_len = header_end - buf + 4;
             
-            // Parse headers to get content length
-            char *headers_copy = malloc(header_len + 1);
-            if (!headers_copy) {
-                log_fetcher(e->url, "Failed to allocate memory for headers");
-                e->cacheable = 0;
-                close(sock);
-                goto done;
-            }
-            memcpy(headers_copy, buf, header_len);
-            headers_copy[header_len] = '\0';
-            
-            content_length = extract_content_length(headers_copy);
-            free(headers_copy);
-            
-            if (content_length <= 0) {
-                log_fetcher(e->url, "No Content-Length header or invalid value, cannot cache");
-                e->cacheable = 0;
-                close(sock);
-                goto done;
-            }
-            
-            if (content_length > CACHE_MAX_BYTES) {
-                log_fetcher(e->url, "File too large for cache");
-                e->cacheable = 0;
-                close(sock);
-                goto done;
-            }
-            
-            // Try to allocate memory for caching
-            cache_evict_if_needed(content_length);
-            
-            pthread_mutex_lock(&cache_mem_lock);
-            if (cache_used_bytes + content_length <= CACHE_MAX_BYTES) {
-                e->data = malloc(content_length);
-                e->capacity = content_length;
-                cache_used_bytes += content_length;
-                e->cacheable = 1;
+            // Анализируем заголовки
+            char headers[CHUNK_SZ];
+            if (header_len < sizeof(headers)) {
+                memcpy(headers, buf, header_len);
+                headers[header_len] = '\0';
+                
+                int content_length = extract_content_length(headers, header_len);
+                if (content_length <= 0) {
+                    log_fetcher(e->url, "No Content-Length header or invalid value, cannot cache");
+                    e->cacheable = 0;
+                    // Освобождаем сокет для прямого стриминга
+                    close(sock);
+                    goto done;
+                }
+                
+                if (content_length > CACHE_MAX_BYTES) {
+                    log_fetcher(e->url, "File too large for cache, streaming directly");
+                    e->cacheable = 0;
+                    close(sock);
+                    goto done;
+                }
+                
                 e->content_length = content_length;
-                log_fetcher(e->url, "Memory allocated for caching");
-            } else {
-                e->cacheable = 0;
-                log_fetcher(e->url, "Not enough cache space");
-            }
-            pthread_mutex_unlock(&cache_mem_lock);
-            
-            if (!e->cacheable) {
-                close(sock);
-                goto done;
-            }
-            
-            // Copy body part after headers
-            size_t body_bytes = r - header_len;
-            if (body_bytes > 0) {
-                pthread_mutex_lock(&e->lock);
-                memcpy(e->data, buf + header_len, body_bytes);
-                e->size = body_bytes;
-                pthread_cond_broadcast(&e->cond);
-                pthread_mutex_unlock(&e->lock);
-            }
-            
-            // If we got everything in first chunk
-            if (body_bytes == content_length) {
-                e->complete = 1;
-                close(sock);
-                log_cache(e->url, "STORED", e->size);
-                log_fetcher(e->url, "Fetch completed in first chunk");
-                goto done;
+                
+                // Пытаемся выделить память для кэша
+                cache_evict_if_needed(content_length);
+                
+                pthread_mutex_lock(&cache_mem_lock);
+                if (cache_used_bytes + content_length <= CACHE_MAX_BYTES) {
+                    e->data = malloc(content_length);
+                    e->capacity = content_length;
+                    cache_used_bytes += content_length;
+                    e->cacheable = 1;
+                    log_fetcher(e->url, "Memory allocated for caching");
+                } else {
+                    e->cacheable = 0;
+                    log_fetcher(e->url, "Not enough cache space, streaming directly");
+                }
+                pthread_mutex_unlock(&cache_mem_lock);
+                
+                if (!e->cacheable) {
+                    close(sock);
+                    goto done;
+                }
+                
+                // Копируем тело после заголовков
+                size_t body_bytes = r - header_len;
+                if (body_bytes > 0) {
+                    pthread_mutex_lock(&e->lock);
+                    memcpy(e->data, buf + header_len, body_bytes);
+                    e->size = body_bytes;
+                    total_received = body_bytes;
+                    pthread_cond_broadcast(&e->cond);
+                    pthread_mutex_unlock(&e->lock);
+                }
+                
+                // Если получили весь файл сразу
+                if (body_bytes == content_length) {
+                    pthread_mutex_lock(&e->lock);
+                    e->complete = 1;
+                    pthread_cond_broadcast(&e->cond);
+                    pthread_mutex_unlock(&e->lock);
+                    close(sock);
+                    log_cache(e->url, "STORED", e->size);
+                    log_fetcher(e->url, "Fetch completed in first chunk");
+                    return NULL;
+                }
             }
         }
     }
     
-    // Continue reading if cacheable
+    // Продолжаем чтение если файл кэшируемый
     if (e->cacheable) {
         while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
             pthread_mutex_lock(&e->lock);
@@ -367,12 +358,21 @@ static void *fetcher_thread(void *arg) {
             if (e->size + r <= e->capacity) {
                 memcpy(e->data + e->size, buf, r);
                 e->size += r;
+                total_received += r;
+                
+                if (total_received % (CHUNK_SZ * 10) == 0) {
+                    log_fetcher(e->url, "Received chunk");
+                }
                 
                 pthread_cond_broadcast(&e->cond);
                 pthread_mutex_unlock(&e->lock);
                 
                 if (e->size == e->content_length) {
-                    break; // Got everything
+                    pthread_mutex_lock(&e->lock);
+                    e->complete = 1;
+                    pthread_cond_broadcast(&e->cond);
+                    pthread_mutex_unlock(e->lock);
+                    break;
                 }
             } else {
                 log_fetcher(e->url, "Error: Received more data than expected");
@@ -387,11 +387,14 @@ static void *fetcher_thread(void *arg) {
     close(sock);
 
     if (e->cacheable && e->size == e->content_length) {
+        pthread_mutex_lock(&e->lock);
         e->complete = 1;
+        pthread_cond_broadcast(&e->cond);
+        pthread_mutex_unlock(&e->lock);
         log_cache(e->url, "STORED", e->size);
         log_fetcher(e->url, "Fetch completed and cached successfully");
     } else if (e->cacheable) {
-        log_fetcher(e->url, "Error: Incomplete data received");
+        log_fetcher(e->url, "Error: Incomplete data received, not caching");
         pthread_mutex_lock(&cache_mem_lock);
         cache_used_bytes -= e->capacity;
         pthread_mutex_unlock(&cache_mem_lock);
@@ -400,19 +403,23 @@ static void *fetcher_thread(void *arg) {
         e->size = 0;
         e->capacity = 0;
         e->cacheable = 0;
+        pthread_mutex_lock(&e->lock);
+        e->complete = 1;
+        pthread_cond_broadcast(&e->cond);
+        pthread_mutex_unlock(&e->lock);
     }
 
 done:
     pthread_mutex_lock(&e->lock);
-    if (!e->complete) e->complete = 1;
+    if (!e->complete) {
+        e->complete = 1;
+    }
     pthread_cond_broadcast(&e->cond);
     pthread_mutex_unlock(&e->lock);
     return NULL;
 }
 
-static void stream_response_directly(int client_fd, const char *url) {
-    log_client("direct", 0, "Streaming response directly (not cached)");
-    
+static void stream_directly(int client_fd, const char *url) {
     char host[MAX_HOST], port[MAX_PORT], path[MAX_URL];
     if (parse_url(url, host, port, path) < 0) {
         const char *err = "HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n";
@@ -435,9 +442,29 @@ static void stream_response_directly(int client_fd, const char *url) {
 
     char buf[CHUNK_SZ];
     ssize_t r;
+    int headers_complete = 0;
+    size_t header_len = 0;
+    
+    // Отправляем клиенту свои заголовки
+    const char *hdr = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
+    send_all(client_fd, hdr, strlen(hdr));
     
     while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
-        send_all(client_fd, buf, r);
+        if (!headers_complete) {
+            char *header_end = memmem(buf, r, "\r\n\r\n", 4);
+            if (header_end) {
+                headers_complete = 1;
+                header_len = header_end - buf + 4;
+                
+                // Отправляем только тело (после заголовков)
+                size_t body_bytes = r - header_len;
+                if (body_bytes > 0) {
+                    send_all(client_fd, buf + header_len, body_bytes);
+                }
+            }
+        } else {
+            send_all(client_fd, buf, r);
+        }
     }
 
     close(sock);
@@ -478,7 +505,7 @@ static void *client_thread(void *arg) {
         log_client(client_ip, client_port, "Creating new cache entry");
         e = calloc(1, sizeof(*e));
         strcpy(e->url, url);
-        e->cacheable = 1;
+        e->cacheable = 1;  // Пытаемся кэшировать по умолчанию
         e->refcount = 1;
         pthread_mutex_init(&e->lock, NULL);
         pthread_cond_init(&e->cond, NULL);
@@ -513,14 +540,17 @@ static void *client_thread(void *arg) {
     }
     
     int cacheable = e->cacheable;
+    char *cached_data = e->data;
+    size_t cached_size = e->size;
     pthread_mutex_unlock(&e->lock);
     
-    if (cacheable && e->data && e->size > 0) {
+    if (cacheable && cached_data && cached_size > 0) {
         const char *hdr = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n";
         send_all(cfd, hdr, strlen(hdr));
-        send_all(cfd, e->data, e->size);
+        send_all(cfd, cached_data, cached_size);
     } else {
-        stream_response_directly(cfd, url);
+        log_client(client_ip, client_port, "Streaming directly (not cached)");
+        stream_directly(cfd, url);
     }
 
     log_client(client_ip, client_port, "Request completed");
