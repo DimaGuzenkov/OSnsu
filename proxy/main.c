@@ -20,7 +20,6 @@
 #define CHUNK_SZ 8192
 
 #define CACHE_MAX_BYTES (20 * 1024 * 1024)
-#define CACHE_TTL_SEC   5
 
 typedef struct cache_entry {
     char url[MAX_URL];
@@ -33,7 +32,6 @@ typedef struct cache_entry {
     int cacheable;
 
     int refcount;
-    time_t expire_at;
 
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -84,7 +82,6 @@ static void log_connection(const char *host, int port, const char *message) {
     printf("[CONNECTION %s:%d] %s\n", host, port, message);
 }
 
-/* ================= HELPERS ================= */
 
 static int send_all(int fd, const void *buf, size_t len) {
     size_t off = 0;
@@ -100,7 +97,6 @@ static int send_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-/* ================= URL PARSER ================= */
 
 static int parse_url(const char *url, char *host, char *port, char *path) {
     const char *p = strstr(url, "://");
@@ -122,7 +118,6 @@ static int parse_url(const char *url, char *host, char *port, char *path) {
     return 0;
 }
 
-/* ================= CACHE EVICTION ================= */
 
 static void cache_remove_entry(cache_entry *e) {
     cache_entry **pp = &cache_table;
@@ -157,13 +152,13 @@ static void cache_evict_if_needed(size_t needed) {
             return;
 
         cache_entry *victim = NULL;
-        time_t oldest = LONG_MAX;
 
         pthread_mutex_lock(&cache_table_lock);
         for (cache_entry *e = cache_table; e; e = e->next) {
-            if (e->complete && e->refcount == 0 && e->expire_at < oldest) {
-                oldest = e->expire_at;
+            if (e->complete && e->refcount == 0) {
+                // Выбираем первую попавшуюся неиспользуемую запись для удаления
                 victim = e;
+                break;
             }
         }
 
@@ -182,36 +177,19 @@ static void cache_evict_if_needed(size_t needed) {
     }
 }
 
-/* ================= CACHE LOOKUP ================= */
 
 static cache_entry *cache_lookup(const char *url) {
-    time_t now = time(NULL);
-
     pthread_mutex_lock(&cache_table_lock);
 
-    cache_entry *prev = NULL;
     cache_entry *e = cache_table;
-    int index = 0;
-
     while (e) {
         if (strcmp(e->url, url) == 0) {
-            if (e->expire_at && e->expire_at < now) {
-                log_cache(url, "EXPIRED (removing)", e->capacity);
-                cache_entry *dead = e;
-                if (prev) prev->next = e->next;
-                else cache_table = e->next;
-                e = e->next;
-                cache_remove_entry(dead);
-                continue;
-            }
             e->refcount++;
             pthread_mutex_unlock(&cache_table_lock);
             log_cache(url, "HIT", e->size);
             return e;
         }
-        prev = e;
         e = e->next;
-        index++;
     }
 
     pthread_mutex_unlock(&cache_table_lock);
@@ -219,7 +197,6 @@ static cache_entry *cache_lookup(const char *url) {
     return NULL;
 }
 
-/* ================= FETCHER ================= */
 
 static void *fetcher_thread(void *arg) {
     cache_entry *e = arg;
@@ -310,7 +287,6 @@ static void *fetcher_thread(void *arg) {
 done:
     pthread_mutex_lock(&e->lock);
     e->complete = 1;
-    e->expire_at = time(NULL) + CACHE_TTL_SEC;
     
     if (e->cacheable) {
         log_cache(e->url, "STORED", e->size);
@@ -324,7 +300,6 @@ done:
     return NULL;
 }
 
-/* ================= CLIENT ================= */
 
 static void *client_thread(void *arg) {
     int cfd = (intptr_t)arg;
@@ -424,7 +399,6 @@ static void *client_thread(void *arg) {
     return NULL;
 }
 
-/* ================= MAIN ================= */
 
 int main(int argc, char **argv) {
     if (argc != 2) {
