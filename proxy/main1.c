@@ -302,7 +302,7 @@ static void *fetcher_thread(void *arg) {
             printf("Head size: %d\n", header_len);
             
             // Извлекаем Content-Length
-            char *headers = (char *)malloc(header_len + 1);
+            char *headers = (char *)malloc(221 + 1);
             if (headers) {
                 memcpy(headers, header_buf, header_len);
                 headers[header_len] = '\0';
