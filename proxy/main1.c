@@ -314,6 +314,7 @@ static void *fetcher_thread(void *arg) {
                 } else {
                     content_length = cl;
                     total_size = header_len + content_length;
+                    printf("File size %d , %d", content_length, total_size);
                     
                     if (total_size > CACHE_MAX_BYTES) {
                         log_fetcher(e->url, "File too large for cache");
