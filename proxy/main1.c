@@ -304,6 +304,7 @@ static void *fetcher_thread(void *arg) {
             if (headers) {
                 memcpy(headers, header_buf, header_len);
                 headers[header_len] = '\0';
+                printf("%s", headers);
                 
                 int cl = extract_content_length(headers);
                 free(headers);
