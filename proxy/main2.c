@@ -427,6 +427,7 @@ static void *fetcher_thread(void *arg) {
         log_fetcher(e->url, "Fetch completed and cached successfully");
     } else if (e->cacheable) {
         log_fetcher(e->url, "Error: Incomplete data received");
+        printf("%d, %d\n", e->capacity, e->size);
         pthread_mutex_lock(&cache_mem_lock);
         cache_used_bytes -= e->capacity;
         pthread_mutex_unlock(&cache_mem_lock);
