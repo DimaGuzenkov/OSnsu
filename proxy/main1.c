@@ -299,7 +299,7 @@ static void *fetcher_thread(void *arg) {
         if (header_end) {
             headers_complete = 1;
             size_t header_len = header_end - header_buf + 4;
-            printf("Head size: %d\n", header_len);
+            printf("Head size: %d, %d\n", header_len, header_len == 221);
             
             // Извлекаем Content-Length
             char *headers = (char *)malloc(221 + 1);
