@@ -288,6 +288,7 @@ static void *fetcher_thread(void *arg) {
     // Читаем пока не получим все заголовки
     while (!headers_complete) {
         ssize_t r = recv(sock, header_buf + header_bytes, sizeof(header_buf) - header_bytes, 0);
+        printf("%s\n", header_buf);
         if (r <= 0) {
             break;
         }
@@ -304,7 +305,7 @@ static void *fetcher_thread(void *arg) {
             if (headers) {
                 memcpy(headers, header_buf, header_len);
                 headers[header_len] = '\0';
-                printf("%s", headers);
+                printf("%s\n", headers);
                 
                 int cl = extract_content_length(headers);
                 free(headers);
@@ -315,7 +316,7 @@ static void *fetcher_thread(void *arg) {
                 } else {
                     content_length = cl;
                     total_size = header_len + content_length;
-                    printf("File size %d , %d", content_length, total_size);
+                    printf("File size %d , %d\n", content_length, total_size);
                     
                     if (total_size > CACHE_MAX_BYTES) {
                         log_fetcher(e->url, "File too large for cache");
