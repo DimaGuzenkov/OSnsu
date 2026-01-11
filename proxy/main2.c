@@ -13,46 +13,24 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/time.h>
-#include <http_parser.h>
 
 #define MAX_URL 1024
 #define MAX_HOST 256
 #define MAX_PORT 16
 #define CHUNK_SZ 8192
-#define HEADER_BUFFER_SIZE 4096
 
 #define CACHE_MAX_BYTES (20 * 1024 * 1024)
 
-// Структура для хранения информации о HTTP-ответе
-typedef struct {
-    int status_code;
-    size_t content_length;
-    int headers_complete;
-    int is_chunked;
-    int keep_alive;
-} http_response_info;
-
-// Структура для парсинга
-typedef struct {
-    http_response_info info;
-    char *headers;
-    size_t headers_len;
-    size_t body_received;
-} parse_context;
-
-// Структура записи кэша
 typedef struct cache_entry {
     char url[MAX_URL];
 
-    // HTTP заголовки и данные
-    char *headers;
-    size_t headers_len;
     char *data;
     size_t size;
     size_t capacity;
 
     int complete;
     int cacheable;
+
     int refcount;
 
     pthread_mutex_t lock;
@@ -62,12 +40,15 @@ typedef struct cache_entry {
 } cache_entry;
 
 /* ================= GLOBAL CACHE ================= */
+
 static cache_entry *cache_table = NULL;
 static pthread_mutex_t cache_table_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static size_t cache_used_bytes = 0;
 static pthread_mutex_t cache_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ================= LOGGING HELPERS ================= */
+
 static void log_time() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -77,75 +58,30 @@ static void log_time() {
     printf("[%s.%03ld] ", buffer, tv.tv_usec / 1000);
 }
 
-static void log_message(const char *category, const char *message) {
+static void log_client(const char *client_ip, int client_port, const char *message) {
     log_time();
-    printf("[%s] %s\n", category, message);
+    printf("[CLIENT %s:%d] %s\n", client_ip, client_port, message);
 }
 
-/* ================= HTTP PARSER CALLBACKS ================= */
-static int on_status(http_parser *parser, const char *at, size_t length) {
-    parse_context *ctx = (parse_context *)parser->data;
-    // Можно сохранить статус сообщение если нужно
-    return 0;
-}
-
-static int on_header_field(http_parser *parser, const char *at, size_t length) {
-    parse_context *ctx = (parse_context *)parser->data;
-    // Добавляем заголовок в буфер
-    if (ctx->headers) {
-        size_t new_len = ctx->headers_len + length;
-        char *new_headers = realloc(ctx->headers, new_len + 1);
-        if (new_headers) {
-            ctx->headers = new_headers;
-            memcpy(ctx->headers + ctx->headers_len, at, length);
-            ctx->headers_len = new_len;
-            ctx->headers[ctx->headers_len] = '\0';
-        }
+static void log_cache(const char *url, const char *operation, size_t size) {
+    log_time();
+    printf("[CACHE %s] %s", operation, url);
+    if (size > 0) {
+        printf(" (%zu bytes)", size);
     }
-    return 0;
+    printf("\n");
 }
 
-static int on_header_value(http_parser *parser, const char *at, size_t length) {
-    parse_context *ctx = (parse_context *)parser->data;
-    // Добавляем значение заголовка в буфер
-    if (ctx->headers) {
-        size_t new_len = ctx->headers_len + length;
-        char *new_headers = realloc(ctx->headers, new_len + 1);
-        if (new_headers) {
-            ctx->headers = new_headers;
-            memcpy(ctx->headers + ctx->headers_len, at, length);
-            ctx->headers_len = new_len;
-            ctx->headers[ctx->headers_len] = '\0';
-        }
-    }
-    return 0;
+static void log_fetcher(const char *url, const char *message) {
+    log_time();
+    printf("[FETCHER %s] %s\n", url, message);
 }
 
-static int on_headers_complete(http_parser *parser) {
-    parse_context *ctx = (parse_context *)parser->data;
-    ctx->info.status_code = parser->status_code;
-    ctx->info.content_length = parser->content_length;
-    ctx->info.headers_complete = 1;
-    ctx->info.is_chunked = (parser->flags & F_CHUNKED);
-    ctx->info.keep_alive = http_should_keep_alive(parser);
-    
-    log_message("PARSER", "Headers complete");
-    return 0;
+static void log_connection(const char *host, int port, const char *message) {
+    log_time();
+    printf("[CONNECTION %s:%d] %s\n", host, port, message);
 }
 
-static int on_body(http_parser *parser, const char *at, size_t length) {
-    parse_context *ctx = (parse_context *)parser->data;
-    ctx->body_received += length;
-    return 0;
-}
-
-static int on_message_complete(http_parser *parser) {
-    parse_context *ctx = (parse_context *)parser->data;
-    log_message("PARSER", "Message complete");
-    return 0;
-}
-
-/* ================= HELPER FUNCTIONS ================= */
 static int send_all(int fd, const void *buf, size_t len) {
     size_t off = 0;
     const char *p = buf;
@@ -161,62 +97,41 @@ static int send_all(int fd, const void *buf, size_t len) {
 }
 
 static int parse_url(const char *url, char *host, char *port, char *path) {
-    // Парсим URL в формате http://host:port/path
-    if (strncmp(url, "http://", 7) != 0) {
-        return -1;
-    }
-    
-    const char *p = url + 7;
+    const char *p = strstr(url, "://");
+    if (!p) return -1;
+    p += 3;
+
     const char *slash = strchr(p, '/');
-    if (!slash) {
-        // Нет пути, используем "/"
-        strcpy(path, "/");
-        slash = p + strlen(p);
-    } else {
-        strcpy(path, slash);
-    }
-    
+    if (!slash) return -1;
+
     const char *colon = memchr(p, ':', slash - p);
     if (colon) {
-        // Есть порт
-        size_t host_len = colon - p;
-        if (host_len >= MAX_HOST) return -1;
-        strncpy(host, p, host_len);
-        host[host_len] = '\0';
-        
-        size_t port_len = slash - colon - 1;
-        if (port_len >= MAX_PORT) return -1;
-        strncpy(port, colon + 1, port_len);
-        port[port_len] = '\0';
+        snprintf(host, MAX_HOST, "%.*s", (int)(colon - p), p);
+        snprintf(port, MAX_PORT, "%.*s", (int)(slash - colon - 1), colon + 1);
     } else {
-        // Нет порта, используем 80
-        size_t host_len = slash - p;
-        if (host_len >= MAX_HOST) return -1;
-        strncpy(host, p, host_len);
-        host[host_len] = '\0';
+        snprintf(host, MAX_HOST, "%.*s", (int)(slash - p), p);
         strcpy(port, "80");
     }
-    
+    snprintf(path, MAX_URL, "%s", slash);
     return 0;
 }
 
-/* ================= CACHE MANAGEMENT ================= */
 static void cache_remove_entry(cache_entry *e) {
     cache_entry **pp = &cache_table;
-    while (*pp && *pp != e) {
+    while (*pp && *pp != e)
         pp = &(*pp)->next;
-    }
-    if (*pp) {
-        *pp = e->next;
-    }
+    if (*pp) *pp = e->next;
 
     pthread_mutex_lock(&cache_mem_lock);
     cache_used_bytes -= e->capacity;
     pthread_mutex_unlock(&cache_mem_lock);
 
-    log_message("CACHE", "Entry evicted");
-    
-    free(e->headers);
+    log_cache(e->url, "EVICTED", e->capacity);
+    log_time();
+    printf("[CACHE STATS] Cache usage: %zu/%zu bytes (%.1f%%)\n", 
+           cache_used_bytes, CACHE_MAX_BYTES,
+           (double)cache_used_bytes / CACHE_MAX_BYTES * 100);
+
     free(e->data);
     pthread_mutex_destroy(&e->lock);
     pthread_cond_destroy(&e->cond);
@@ -224,38 +139,37 @@ static void cache_remove_entry(cache_entry *e) {
 }
 
 static void cache_evict_if_needed(size_t needed) {
-    int attempts = 0;
-    while (attempts < 10) { // Ограничим попытки
+    int evicted = 0;
+    while (1) {
         pthread_mutex_lock(&cache_mem_lock);
         size_t available = CACHE_MAX_BYTES - cache_used_bytes;
         pthread_mutex_unlock(&cache_mem_lock);
 
-        if (available >= needed) {
+        if (available >= needed)
             return;
-        }
 
         cache_entry *victim = NULL;
+
         pthread_mutex_lock(&cache_table_lock);
-        
-        cache_entry *e = cache_table;
-        while (e) {
+        for (cache_entry *e = cache_table; e; e = e->next) {
             if (e->complete && e->refcount == 0) {
                 victim = e;
                 break;
             }
-            e = e->next;
         }
 
-        if (victim) {
-            cache_remove_entry(victim);
+        if (!victim) {
             pthread_mutex_unlock(&cache_table_lock);
-        } else {
-            pthread_mutex_unlock(&cache_table_lock);
-            log_message("CACHE", "No evictable entries found");
-            break;
+            if (!evicted) {
+                log_time();
+                printf("[CACHE WARNING] No evictable entries found, cache full!\n");
+            }
+            return;
         }
-        
-        attempts++;
+
+        cache_remove_entry(victim);
+        pthread_mutex_unlock(&cache_table_lock);
+        evicted++;
     }
 }
 
@@ -267,15 +181,12 @@ static cache_entry *cache_lookup(const char *url) {
         if (strcmp(e->url, url) == 0) {
             e->refcount++;
             pthread_mutex_unlock(&cache_table_lock);
-            
-            if (e->complete) {
-                if (e->cacheable) {
-                    log_message("CACHE", "Hit (cached)");
-                } else {
-                    log_message("CACHE", "Hit (not cacheable)");
-                }
+            if (e->complete && e->cacheable) {
+                log_cache(url, "HIT", e->size);
+            } else if (e->complete) {
+                log_cache(url, "HIT (NOT CACHEABLE)", e->size);
             } else {
-                log_message("CACHE", "Hit (in progress)");
+                log_cache(url, "HIT (IN PROGRESS)", 0);
             }
             return e;
         }
@@ -283,18 +194,34 @@ static cache_entry *cache_lookup(const char *url) {
     }
 
     pthread_mutex_unlock(&cache_table_lock);
-    log_message("CACHE", "Miss");
+    log_cache(url, "MISS", 0);
     return NULL;
 }
 
-/* ================= CONNECTION HELPERS ================= */
+static int extract_content_length(const char *headers) {
+    const char *content_start = strstr(headers, "Content-Length:");
+    if (!content_start) {
+        content_start = strstr(headers, "Content-length:");
+    }
+    
+    if (!content_start) {
+        return -1;
+    }
+    
+    const char *value_start = content_start + 15;
+    while (*value_start == ' ' || *value_start == '\t' || *value_start == ':') {
+        value_start++;
+    }
+    
+    return atoi(value_start);
+}
+
 static int connect_to_server(const char *host, const char *port) {
     struct addrinfo hints = {0}, *res;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = AF_UNSPEC;
 
     if (getaddrinfo(host, port, &hints, &res) != 0) {
-        log_message("CONNECTION", "getaddrinfo failed");
         return -1;
     }
 
@@ -304,30 +231,24 @@ static int connect_to_server(const char *host, const char *port) {
         return -1;
     }
     
-    // Устанавливаем таймауты
-    struct timeval timeout;
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         freeaddrinfo(res);
         close(sock);
         return -1;
     }
-    
     freeaddrinfo(res);
+    
     return sock;
 }
 
-/* ================= FETCHER THREAD ================= */
 static void *fetcher_thread(void *arg) {
     cache_entry *e = arg;
     
+    log_fetcher(e->url, "Starting fetch");
+
     char host[MAX_HOST], port[MAX_PORT], path[MAX_URL];
     if (parse_url(e->url, host, port, path) < 0) {
-        log_message("FETCHER", "Failed to parse URL");
+        log_fetcher(e->url, "Failed to parse URL");
         pthread_mutex_lock(&e->lock);
         e->complete = 1;
         e->cacheable = 0;
@@ -336,10 +257,11 @@ static void *fetcher_thread(void *arg) {
         return NULL;
     }
 
-    // Подключаемся к серверу
+    log_connection(host, atoi(port), "Resolving address");
+
     int sock = connect_to_server(host, port);
     if (sock < 0) {
-        log_message("FETCHER", "Connection failed");
+        log_connection(host, atoi(port), "Connection failed");
         pthread_mutex_lock(&e->lock);
         e->complete = 1;
         e->cacheable = 0;
@@ -348,105 +270,104 @@ static void *fetcher_thread(void *arg) {
         return NULL;
     }
 
-    // Отправляем запрос
-    char request[1024];
-    snprintf(request, sizeof(request),
-             "GET %s HTTP/1.0\r\n"
-             "Host: %s\r\n"
-             "Connection: close\r\n"
-             "\r\n",
+    log_connection(host, atoi(port), "Connected, sending request");
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
              path, host);
-    
-    if (send_all(sock, request, strlen(request)) < 0) {
-        log_message("FETCHER", "Failed to send request");
-        close(sock);
-        pthread_mutex_lock(&e->lock);
-        e->complete = 1;
-        e->cacheable = 0;
-        pthread_cond_broadcast(&e->cond);
-        pthread_mutex_unlock(&e->lock);
-        return NULL;
-    }
+    send_all(sock, req, strlen(req));
 
-    // Парсим ответ с помощью http-parser
-    http_parser_settings settings = {0};
-    settings.on_status = on_status;
-    settings.on_header_field = on_header_field;
-    settings.on_header_value = on_header_value;
-    settings.on_headers_complete = on_headers_complete;
-    settings.on_body = on_body;
-    settings.on_message_complete = on_message_complete;
+    // Сначала читаем заголовки, чтобы получить размер
+    char header_buf[CHUNK_SZ];
+    ssize_t header_bytes = 0;
+    int headers_complete = 0;
+    size_t content_length = 0;
+    size_t total_size = 0;
     
-    http_parser parser;
-    http_parser_init(&parser, HTTP_RESPONSE);
-    
-    parse_context ctx = {0};
-    ctx.headers = malloc(1);
-    ctx.headers[0] = '\0';
-    parser.data = &ctx;
-    
-    // Читаем данные и парсим
-    char buffer[CHUNK_SZ];
-    ssize_t bytes_read;
-    int parse_result = 0;
-    
-    while (!ctx.info.headers_complete && 
-           (bytes_read = recv(sock, buffer, sizeof(buffer), 0)) > 0) {
-        
-        size_t parsed = http_parser_execute(&parser, &settings, buffer, bytes_read);
-        if (parsed != bytes_read) {
-            log_message("FETCHER", "HTTP parsing error");
-            parse_result = -1;
+    // Читаем пока не получим все заголовки
+    while (!headers_complete) {
+        ssize_t r = recv(sock, header_buf + header_bytes, sizeof(header_buf) - header_bytes, 0);
+        if (r <= 0) {
             break;
         }
+        header_bytes += r;
         
-        if (ctx.info.headers_complete) {
-            // Проверяем, можно ли кэшировать
-            if (ctx.info.status_code != 200) {
-                e->cacheable = 0;
-                log_message("FETCHER", "Non-200 status code");
-            } else if (ctx.info.is_chunked) {
-                e->cacheable = 0;
-                log_message("FETCHER", "Chunked encoding not supported for caching");
-            } else if (ctx.info.content_length == 0) {
-                e->cacheable = 0;
-                log_message("FETCHER", "No content length or zero length");
-            } else if (ctx.info.content_length > CACHE_MAX_BYTES) {
-                e->cacheable = 0;
-                log_message("FETCHER", "Content too large for cache");
-            } else {
-                // Пытаемся выделить память
-                size_t total_size = ctx.info.content_length;
-                cache_evict_if_needed(total_size);
+        // Ищем конец заголовков
+        char *header_end = memmem(header_buf, header_bytes, "\r\n\r\n", 4);
+        if (header_end) {
+            headers_complete = 1;
+            size_t header_len = header_end - header_buf + 4;
+            
+            // Извлекаем Content-Length
+            char *headers = malloc(header_len + 1);
+            if (headers) {
+                memcpy(headers, header_buf, header_len);
+                headers[header_len] = '\0';
                 
-                pthread_mutex_lock(&cache_mem_lock);
-                if (cache_used_bytes + total_size <= CACHE_MAX_BYTES) {
-                    e->data = malloc(total_size);
-                    if (e->data) {
-                        e->capacity = total_size;
-                        e->size = 0;
-                        cache_used_bytes += total_size;
-                        e->cacheable = 1;
-                        log_message("FETCHER", "Memory allocated for caching");
-                    } else {
-                        e->cacheable = 0;
-                        log_message("FETCHER", "Memory allocation failed");
-                    }
-                } else {
+                int cl = extract_content_length(headers);
+                free(headers);
+                
+                pthread_mutex_lock(&e->lock);
+                if (cl <= 0) {
+                    log_fetcher(e->url, "No Content-Length header or invalid value");
                     e->cacheable = 0;
-                    log_message("FETCHER", "Not enough cache space");
+                } else {
+                    content_length = cl;
+                    total_size = header_len + content_length;
+                    
+                    if (total_size > CACHE_MAX_BYTES) {
+                        log_fetcher(e->url, "File too large for cache");
+                        e->cacheable = 0;
+                    } else {
+                        // Пытаемся выделить память
+                        cache_evict_if_needed(total_size);
+                        
+                        pthread_mutex_lock(&cache_mem_lock);
+                        if (cache_used_bytes + total_size <= CACHE_MAX_BYTES) {
+                            e->data = malloc(total_size);
+                            if (e->data) {
+                                e->capacity = total_size;
+                                cache_used_bytes += total_size;
+                                e->cacheable = 1;
+                                // Копируем заголовки
+                                memcpy(e->data, header_buf, header_len);
+                                e->size = header_len;
+                                log_fetcher(e->url, "Memory allocated for caching");
+                            } else {
+                                e->cacheable = 0;
+                                log_fetcher(e->url, "Failed to allocate memory");
+                            }
+                        } else {
+                            e->cacheable = 0;
+                            log_fetcher(e->url, "Not enough cache space");
+                        }
+                        pthread_mutex_unlock(&cache_mem_lock);
+                    }
                 }
-                pthread_mutex_unlock(&cache_mem_lock);
+                pthread_mutex_unlock(&e->lock);
             }
             
             break;
         }
+        
+        if (header_bytes >= sizeof(header_buf)) {
+            // Заголовки слишком большие
+            log_fetcher(e->url, "Headers too large");
+            pthread_mutex_lock(&e->lock);
+            e->cacheable = 0;
+            pthread_mutex_unlock(&e->lock);
+            break;
+        }
     }
     
-    // Если не можем кэшировать, закрываем соединение
-    if (!e->cacheable || parse_result < 0) {
+    // Если объект не кэшируемый, заканчиваем
+    pthread_mutex_lock(&e->lock);
+    int cacheable = e->cacheable;
+    pthread_mutex_unlock(&e->lock);
+    
+    if (!cacheable) {
         close(sock);
-        free(ctx.headers);
         pthread_mutex_lock(&e->lock);
         e->complete = 1;
         pthread_cond_broadcast(&e->cond);
@@ -454,49 +375,67 @@ static void *fetcher_thread(void *arg) {
         return NULL;
     }
     
-    // Если можем кэшировать, продолжаем чтение
-    size_t total_read = 0;
-    while (total_read < ctx.info.content_length && 
-           (bytes_read = recv(sock, buffer, sizeof(buffer), 0)) > 0) {
-        
+    // Если мы уже получили часть тела вместе с заголовками
+    size_t body_offset = 0;
+    if (headers_complete) {
+        size_t header_len = 0;
+        char *header_end = memmem(header_buf, header_bytes, "\r\n\r\n", 4);
+        if (header_end) {
+            header_len = header_end - header_buf + 4;
+            body_offset = header_bytes - header_len;
+        }
+    }
+    
+    // Если мы уже получили часть тела вместе с заголовками
+    if (body_offset > 0 && e->size + body_offset <= e->capacity) {
         pthread_mutex_lock(&e->lock);
-        
-        size_t to_copy = bytes_read;
-        if (total_read + to_copy > e->capacity) {
-            to_copy = e->capacity - total_read;
-        }
-        
-        if (to_copy > 0) {
-            memcpy(e->data + total_read, buffer, to_copy);
-            total_read += to_copy;
-            e->size = total_read;
-        }
-        
+        memcpy(e->data + e->size, header_buf + (header_bytes - body_offset), body_offset);
+        e->size += body_offset;
         pthread_cond_broadcast(&e->cond);
         pthread_mutex_unlock(&e->lock);
     }
     
-    close(sock);
-    free(ctx.headers);
+    // Читаем остальные данные
+    char buf[CHUNK_SZ];
+    ssize_t r;
     
-    // Проверяем, все ли данные получены
+    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        pthread_mutex_lock(&e->lock);
+        
+        if (e->size + r <= e->capacity) {
+            memcpy(e->data + e->size, buf, r);
+            e->size += r;
+            pthread_cond_broadcast(&e->cond);
+            pthread_mutex_unlock(&e->lock);
+        } else {
+            // Получили больше, чем ожидали
+            log_fetcher(e->url, "Received more data than expected");
+            e->cacheable = 0;
+            pthread_mutex_unlock(&e->lock);
+            break;
+        }
+    }
+    
+    close(sock);
+    
     pthread_mutex_lock(&e->lock);
-    if (total_read == ctx.info.content_length) {
+    if (e->cacheable && e->size == e->capacity) {
         e->complete = 1;
-        log_message("FETCHER", "Fetch completed successfully");
-    } else {
-        // Не все данные получены, освобождаем память
+        log_cache(e->url, "STORED", e->size);
+        log_fetcher(e->url, "Fetch completed and cached successfully");
+    } else if (e->cacheable) {
+        log_fetcher(e->url, "Error: Incomplete data received");
         pthread_mutex_lock(&cache_mem_lock);
         cache_used_bytes -= e->capacity;
         pthread_mutex_unlock(&cache_mem_lock);
-        
         free(e->data);
         e->data = NULL;
         e->size = 0;
         e->capacity = 0;
         e->cacheable = 0;
         e->complete = 1;
-        log_message("FETCHER", "Incomplete data received");
+    } else {
+        e->complete = 1;
     }
     
     pthread_cond_broadcast(&e->cond);
@@ -505,7 +444,37 @@ static void *fetcher_thread(void *arg) {
     return NULL;
 }
 
-/* ================= CLIENT THREAD ================= */
+static void stream_directly(int client_fd, const char *url) {
+    char host[MAX_HOST], port[MAX_PORT], path[MAX_URL];
+    if (parse_url(url, host, port, path) < 0) {
+        const char *err = "HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n";
+        send_all(client_fd, err, strlen(err));
+        return;
+    }
+
+    int sock = connect_to_server(host, port);
+    if (sock < 0) {
+        const char *err = "HTTP/1.0 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+        send_all(client_fd, err, strlen(err));
+        return;
+    }
+
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+             path, host);
+    send_all(sock, req, strlen(req));
+
+    char buf[CHUNK_SZ];
+    ssize_t r;
+    
+    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        send_all(client_fd, buf, r);
+    }
+
+    close(sock);
+}
+
 static void *client_thread(void *arg) {
     int cfd = (intptr_t)arg;
     
@@ -516,111 +485,152 @@ static void *client_thread(void *arg) {
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
     int client_port = ntohs(client_addr.sin_port);
     
-    log_message("CLIENT", "New connection");
-    
-    // Читаем запрос
+    log_client(client_ip, client_port, "New connection");
+
     char req[4096];
     ssize_t rr = recv(cfd, req, sizeof(req) - 1, 0);
     if (rr <= 0) {
-        log_message("CLIENT", "Connection closed");
+        log_client(client_ip, client_port, "Connection closed");
         close(cfd);
         return NULL;
     }
     req[rr] = 0;
-    
-    // Парсим запрос (очень просто)
+
     char method[16], url[MAX_URL];
     if (sscanf(req, "%15s %1023s", method, url) != 2) {
-        log_message("CLIENT", "Invalid request");
+        log_client(client_ip, client_port, "Invalid request");
         close(cfd);
         return NULL;
     }
     
-    log_message("CLIENT", url);
-    
-    // Ищем в кэше
+    log_client(client_ip, client_port, url);
+
     cache_entry *e = cache_lookup(url);
-    
     if (!e) {
-        log_message("CLIENT", "Creating new cache entry");
+        log_client(client_ip, client_port, "Creating new cache entry");
         e = calloc(1, sizeof(*e));
-        strncpy(e->url, url, MAX_URL - 1);
-        e->url[MAX_URL - 1] = '\0';
-        e->cacheable = 1;
+        strcpy(e->url, url);
+        e->cacheable = 1;  // Предполагаем, что объект кэшируемый
         e->refcount = 1;
         pthread_mutex_init(&e->lock, NULL);
         pthread_cond_init(&e->cond, NULL);
-        
+
         pthread_mutex_lock(&cache_table_lock);
         e->next = cache_table;
         cache_table = e;
-        pthread_mutex_unlock(&cache_table_lock);
         
+        log_time();
+        printf("[CACHE STATS] Total cache entries: ");
+        int count = 0;
+        cache_entry *temp = cache_table;
+        while (temp) {
+            count++;
+            temp = temp->next;
+        }
+        printf("%d\n", count);
+        
+        pthread_mutex_unlock(&cache_table_lock);
+
         pthread_t th;
         pthread_create(&th, NULL, fetcher_thread, e);
         pthread_detach(th);
-    }
-    
-    // Ждем завершения загрузки
-    pthread_mutex_lock(&e->lock);
-    while (!e->complete) {
-        pthread_cond_wait(&e->cond, &e->lock);
-    }
-    
-    int cacheable = e->cacheable;
-    char *cached_data = e->data;
-    size_t cached_size = e->size;
-    pthread_mutex_unlock(&e->lock);
-    
-    if (cacheable && cached_data && cached_size > 0) {
-        // Отправляем данные из кэша
-        send_all(cfd, cached_data, cached_size);
-        log_message("CLIENT", "Sent from cache");
     } else {
-        // Прямой стриминг
-        log_message("CLIENT", "Direct streaming (not cacheable)");
-        // В реальности нужно реализовать прямой стриминг
-        const char *error_msg = "HTTP/1.0 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-        send_all(cfd, error_msg, strlen(error_msg));
+        if (e->complete && e->cacheable) {
+            log_client(client_ip, client_port, "Using cached entry");
+        } else if (e->complete) {
+            log_client(client_ip, client_port, "Entry not cacheable");
+        } else {
+            log_client(client_ip, client_port, "Waiting for download to complete");
+        }
+    }
+
+    pthread_mutex_lock(&e->lock);
+    
+    // Для некэшируемых объектов используем прямой стриминг
+    if (e->complete && !e->cacheable) {
+        pthread_mutex_unlock(&e->lock);
+        log_client(client_ip, client_port, "Streaming directly (non-cacheable)");
+        stream_directly(cfd, url);
+        goto cleanup;
     }
     
-    close(cfd);
+    // Для кэшируемых объектов: отправляем данные по мере их поступления
+    size_t sent = 0;
     
-    // Уменьшаем счетчик ссылок
+    while (1) {
+        // Ждем, пока появятся новые данные или загрузка завершится
+        while (sent >= e->size && !e->complete) {
+            pthread_cond_wait(&e->cond, &e->lock);
+        }
+        
+        // Проверяем, не стал ли объект некэшируемым в процессе
+        if (e->complete && !e->cacheable) {
+            pthread_mutex_unlock(&e->lock);
+            log_client(client_ip, client_port, "Object became non-cacheable during download");
+            stream_directly(cfd, url);
+            goto cleanup;
+        }
+        
+        // Если есть новые данные для отправки
+        if (sent < e->size) {
+            size_t to_send = e->size - sent;
+            char *data_to_send = e->data + sent;
+            
+            // Отпускаем мьютекс на время отправки
+            pthread_mutex_unlock(&e->lock);
+            
+            // Отправляем данные клиенту
+            if (send_all(cfd, data_to_send, to_send) < 0) {
+                log_client(client_ip, client_port, "Failed to send data");
+                pthread_mutex_lock(&e->lock);
+                break;
+            }
+            
+            sent += to_send;
+            pthread_mutex_lock(&e->lock);
+        }
+        
+        // Если загрузка завершена и все данные отправлены
+        if (e->complete && sent >= e->size) {
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&e->lock);
+    log_client(client_ip, client_port, "Request completed");
+
+cleanup:
+    close(cfd);
+
     pthread_mutex_lock(&e->lock);
     e->refcount--;
+    log_cache(e->url, "REFCOUNT DECREMENT", e->refcount);
     pthread_mutex_unlock(&e->lock);
-    
+
     return NULL;
 }
 
-/* ================= MAIN ================= */
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         return 1;
     }
-    
+
     int port = atoi(argv[1]);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "Invalid port: %s\n", argv[1]);
-        return 1;
-    }
-    
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
         perror("socket");
         return 1;
     }
-    
+
     int opt = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+
     struct sockaddr_in sa = {0};
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = INADDR_ANY;
-    
+
     if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         perror("bind");
         close(s);
@@ -632,28 +642,30 @@ int main(int argc, char **argv) {
         close(s);
         return 1;
     }
-    
-    log_message("SERVER", "Proxy server started");
-    
+
+    log_time();
+    printf("[SERVER] Starting proxy server on port %d\n", port);
+    log_time();
+    printf("[CACHE STATS] Cache limit: %zu bytes\n", CACHE_MAX_BYTES);
+
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int cfd = accept(s, (struct sockaddr*)&client_addr, &client_len);
         
         if (cfd < 0) {
-            log_message("SERVER", "Accept failed");
+            log_time();
+            printf("[SERVER ERROR] Accept failed\n");
             continue;
         }
         
         pthread_t th;
         if (pthread_create(&th, NULL, client_thread, (void*)(intptr_t)cfd) != 0) {
-            log_message("SERVER", "Failed to create thread");
+            log_time();
+            printf("[SERVER ERROR] Failed to create thread\n");
             close(cfd);
             continue;
         }
         pthread_detach(th);
     }
-    
-    close(s);
-    return 0;
 }
