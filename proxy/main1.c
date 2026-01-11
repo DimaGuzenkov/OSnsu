@@ -288,7 +288,7 @@ static void *fetcher_thread(void *arg) {
     // Читаем пока не получим все заголовки
     while (!headers_complete) {
         ssize_t r = recv(sock, header_buf + header_bytes, sizeof(header_buf) - header_bytes, 0);
-        printf("All:\n%s\n", header_buf);
+        // printf("All:\n%s\n", header_buf);
         if (r <= 0) {
             break;
         }
@@ -300,14 +300,14 @@ static void *fetcher_thread(void *arg) {
         if (header_end) {
             headers_complete = 1;
             size_t header_len = (int)header_end - (int)header_buf + 4;
-            printf("Head size: %ld, %d, %p, %p\n", header_len, header_len == 221, header_end, header_buf);
+            // printf("Head size: %ld, %d, %p, %p\n", header_len, header_len == 221, header_end, header_buf);
             
             // Извлекаем Content-Length
             char *headers = (char *)malloc(header_len + 1);
             if (headers) {
                 memcpy(headers, header_buf, header_len);
                 headers[header_len] = '\0';
-                printf("Headers:\n%s\n", headers);
+                // printf("Headers:\n%s\n", headers);
                 
                 int cl = extract_content_length(headers);
                 free(headers);
@@ -349,8 +349,6 @@ static void *fetcher_thread(void *arg) {
                         pthread_mutex_unlock(&cache_mem_lock);
                     }
                 }
-            } else {
-                printf("headers is null");
             }
             
             break;
@@ -366,6 +364,7 @@ static void *fetcher_thread(void *arg) {
     
     if (!e->cacheable) {
         // Закрываем сокет, данные не кэшируются
+        log_cache(e->url, "")
         close(sock);
         pthread_mutex_lock(&e->lock);
         e->complete = 1;
