@@ -310,7 +310,7 @@ static void *fetcher_thread(void *arg) {
                 printf("Headers:\n%s\n", headers);
                 
                 int cl = extract_content_length(headers);
-                free(headers);
+                // free(headers);
                 
                 if (cl <= 0) {
                     log_fetcher(e->url, "No Content-Length header or invalid value");
