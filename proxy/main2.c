@@ -400,7 +400,7 @@ static void *fetcher_thread(void *arg) {
     char buf[CHUNK_SZ];
     ssize_t r;
     
-    while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+    while (e->size < e->capacity && (r = recv(sock, buf, sizeof(buf), 0)) > 0) {
         pthread_mutex_lock(&e->lock);
         
         if (e->size + r <= e->capacity) {
