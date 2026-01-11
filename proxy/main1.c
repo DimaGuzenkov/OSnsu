@@ -288,7 +288,7 @@ static void *fetcher_thread(void *arg) {
     // Читаем пока не получим все заголовки
     while (!headers_complete) {
         ssize_t r = recv(sock, header_buf + header_bytes, sizeof(header_buf) - header_bytes, 0);
-        printf("%s\n", header_buf);
+        printf("All:\n%s\n", header_buf);
         if (r <= 0) {
             break;
         }
@@ -305,7 +305,7 @@ static void *fetcher_thread(void *arg) {
             if (headers) {
                 memcpy(headers, header_buf, header_len);
                 headers[header_len] = '\0';
-                printf("%s\n", headers);
+                printf("Headers:\n%s\n", headers);
                 
                 int cl = extract_content_length(headers);
                 free(headers);
