@@ -299,7 +299,7 @@ static void *fetcher_thread(void *arg) {
         if (header_end) {
             headers_complete = 1;
             size_t header_len = header_end - header_buf + 4;
-            printf("Head size: %d", header_len);
+            printf("Head size: %d\n", header_len);
             
             // Извлекаем Content-Length
             char *headers = malloc(header_len + 1);
@@ -348,6 +348,8 @@ static void *fetcher_thread(void *arg) {
                         pthread_mutex_unlock(&cache_mem_lock);
                     }
                 }
+            } else {
+                printf("headers is null");
             }
             
             break;
