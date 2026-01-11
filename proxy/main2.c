@@ -412,8 +412,8 @@ static void *fetcher_thread(void *arg) {
         } else {
             // Получили больше, чем ожидали
             log_fetcher(e->url, "Received more data than expected");
-            printf("%ld, %ld, %ld\n", e->capacity, e->size, r);
             e->cacheable = 0;
+            pthread_cond_broadcast(&e->cond);
             pthread_mutex_unlock(&e->lock);
             break;
         }
@@ -428,7 +428,6 @@ static void *fetcher_thread(void *arg) {
         log_fetcher(e->url, "Fetch completed and cached successfully");
     } else if (e->cacheable) {
         log_fetcher(e->url, "Error: Incomplete data received");
-        printf("%d, %d\n", e->capacity, e->size);
         pthread_mutex_lock(&cache_mem_lock);
         cache_used_bytes -= e->capacity;
         pthread_mutex_unlock(&cache_mem_lock);
