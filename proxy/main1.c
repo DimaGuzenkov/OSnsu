@@ -536,27 +536,59 @@ static void *client_thread(void *arg) {
     }
 
     pthread_mutex_lock(&e->lock);
-    
-    // Ждем завершения загрузки
-    while (!e->complete) {
-        pthread_cond_wait(&e->cond, &e->lock);
-    }
-    
-    // После завершения проверяем, можно ли использовать кэш
-    int cacheable = e->cacheable;
-    char *cached_data = e->data;
-    size_t cached_size = e->size;
-    pthread_mutex_unlock(&e->lock);
-    
-    if (cacheable && cached_data && cached_size > 0) {
-        // Отправляем весь кэшированный ответ
-        send_all(cfd, cached_data, cached_size);
-    } else {
-        // Прямой стриминг
+    if (e->complete && !e->cacheable) {
+        pthread_mutex_unlock(&e->lock);
+        log_client(client_ip, client_port, "Streaming directly (non-cacheable)");
         stream_directly(cfd, url);
+        goto cleanup;
     }
-
+    
+    // Для кэшируемых объектов: отправляем данные по мере их поступления
+    size_t sent = 0;
+    
+    while (1) {
+        // Ждем, пока появятся новые данные или загрузка завершится
+        while ( !e->complete) {
+            pthread_cond_wait(&e->cond, &e->lock);
+        }
+        
+        // Проверяем, не стал ли объект некэшируемым в процессе
+        if (e->complete && !e->cacheable) {
+            pthread_mutex_unlock(&e->lock);
+            log_client(client_ip, client_port, "Object became non-cacheable during download");
+            stream_directly(cfd, url);
+            goto cleanup;
+        }
+        
+        // Если есть новые данные для отправки
+        if (sent < e->size) {
+            size_t to_send = e->size - sent;
+            char *data_to_send = e->data + sent;
+            
+            // Отпускаем мьютекс на время отправки
+            pthread_mutex_unlock(&e->lock);
+            
+            // Отправляем данные клиенту
+            if (send_all(cfd, data_to_send, to_send) < 0) {
+                log_client(client_ip, client_port, "Failed to send data");
+                pthread_mutex_lock(&e->lock);
+                break;
+            }
+            
+            sent += to_send;
+            pthread_mutex_lock(&e->lock);
+        }
+        
+        // Если загрузка завершена и все данные отправлены
+        if (e->complete && sent >= e->size) {
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&e->lock);
     log_client(client_ip, client_port, "Request completed");
+
+cleanup:
     close(cfd);
 
     pthread_mutex_lock(&e->lock);
@@ -565,6 +597,34 @@ static void *client_thread(void *arg) {
     pthread_mutex_unlock(&e->lock);
 
     return NULL;
+    // Ждем завершения загрузки
+    // while (!e->complete) {
+    //     pthread_cond_wait(&e->cond, &e->lock);
+    // }
+    
+    // // После завершения проверяем, можно ли использовать кэш
+    // int cacheable = e->cacheable;
+    // char *cached_data = e->data;
+    // size_t cached_size = e->size;
+    // pthread_mutex_unlock(&e->lock);
+    
+    // if (cacheable && cached_data && cached_size > 0) {
+    //     // Отправляем весь кэшированный ответ
+    //     send_all(cfd, cached_data, cached_size);
+    // } else {
+    //     // Прямой стриминг
+    //     stream_directly(cfd, url);
+    // }
+
+    // log_client(client_ip, client_port, "Request completed");
+    // close(cfd);
+
+    // pthread_mutex_lock(&e->lock);
+    // e->refcount--;
+    // log_cache(e->url, "REFCOUNT DECREMENT", e->refcount);
+    // pthread_mutex_unlock(&e->lock);
+
+    // return NULL;
 }
 
 int main(int argc, char **argv) {
