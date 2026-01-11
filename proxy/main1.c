@@ -391,6 +391,7 @@ static void *fetcher_thread(void *arg) {
         
         if (e->size + r <= e->capacity) {
             memcpy(e->data + e->size, buf, r);
+            printf("%d, %d\n", e->size, r);
             e->size += r;
             pthread_cond_broadcast(&e->cond);
             pthread_mutex_unlock(&e->lock);
@@ -454,9 +455,11 @@ static void stream_directly(int client_fd, const char *url) {
     send_all(sock, req, strlen(req));
 
     char buf[CHUNK_SZ];
-    ssize_t r;
+    ssize_t r, size = 0;
     
     while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        printf("%d, %d\n", size, r);
+        size += r;
         send_all(client_fd, buf, r);
     }
 
