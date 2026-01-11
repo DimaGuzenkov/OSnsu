@@ -364,7 +364,6 @@ static void *fetcher_thread(void *arg) {
     
     if (!e->cacheable) {
         // Закрываем сокет, данные не кэшируются
-        log_cache(e->url, "")
         close(sock);
         pthread_mutex_lock(&e->lock);
         e->complete = 1;
