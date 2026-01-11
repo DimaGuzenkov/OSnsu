@@ -295,7 +295,8 @@ static void *fetcher_thread(void *arg) {
         header_bytes += r;
         
         // Ищем конец заголовков
-        char *header_end = memmem(header_buf, header_bytes, "\r\n\r\n", 4);
+
+        char *header_end = header_buf;//memmem(header_buf, header_bytes, "\r\n\r\n", 4);
         if (header_end) {
             headers_complete = 1;
             size_t header_len = header_end - header_buf + 4;
@@ -304,8 +305,8 @@ static void *fetcher_thread(void *arg) {
             // Извлекаем Content-Length
             char *headers = (char *)malloc(header_len + 1);
             if (headers) {
-                memcpy(headers, header_buf, header_len);
-                headers[header_len] = '\0';
+                //memcpy(headers, header_buf, header_len);
+                // headers[header_len] = '\0';
                 printf("Headers:\n%s\n", headers);
                 
                 int cl = extract_content_length(headers);
