@@ -297,7 +297,7 @@ static void *fetcher_thread(void *arg) {
         char *header_end = memmem(header_buf, header_bytes, "\r\n\r\n", 4);
         if (header_end) {
             headers_complete = 1;
-            size_t header_len = header_end - header_buf + 4;
+            size_t header_len = (int) header_end - (int) header_buf + 4;
             
             // Извлекаем Content-Length
             char *headers = malloc(header_len + 1);
@@ -315,6 +315,7 @@ static void *fetcher_thread(void *arg) {
                 } else {
                     content_length = cl;
                     total_size = header_len + content_length;
+                    printf("%ld\n", total_size);
                     
                     if (total_size > CACHE_MAX_BYTES) {
                         log_fetcher(e->url, "File too large for cache");
