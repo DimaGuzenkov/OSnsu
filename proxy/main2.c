@@ -565,7 +565,7 @@ static void *client_thread(void *arg) {
     
     while (1) {
         // Ждем, пока появятся новые данные или загрузка завершится
-        while (sent >= e->size && !e->complete) {
+        while ( !e->complete) {
             pthread_cond_wait(&e->cond, &e->lock);
         }
         
