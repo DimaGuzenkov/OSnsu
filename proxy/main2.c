@@ -410,6 +410,7 @@ static void *fetcher_thread(void *arg) {
         } else {
             // Получили больше, чем ожидали
             log_fetcher(e->url, "Received more data than expected");
+            printf("%ld, %ld, %ld\n", e->capacity, e->size, r);
             e->cacheable = 0;
             pthread_mutex_unlock(&e->lock);
             break;
