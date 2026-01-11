@@ -470,9 +470,11 @@ static void stream_directly(int client_fd, const char *url) {
     send_all(sock, req, strlen(req));
 
     char buf[CHUNK_SZ];
-    ssize_t r;
+    ssize_t r, size = 0;
     
     while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        printf("%d, %d\n", size, r);
+        size += r;
         send_all(client_fd, buf, r);
     }
 
