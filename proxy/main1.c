@@ -458,7 +458,7 @@ static void stream_directly(int client_fd, const char *url) {
     ssize_t r, size = 0;
     
     while ((r = recv(sock, buf, sizeof(buf), 0)) > 0) {
-        printf("%d, %d\n", size, r);
+        // printf("%d, %d\n", size, r);
         size += r;
         send_all(client_fd, buf, r);
     }
