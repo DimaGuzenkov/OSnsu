@@ -391,7 +391,7 @@ static void *fetcher_thread(void *arg) {
         
         if (e->size + r <= e->capacity) {
             memcpy(e->data + e->size, buf, r);
-            printf("%d, %d\n", e->size, r);
+            // printf("%d, %d\n", e->size, r);
             e->size += r;
             pthread_cond_broadcast(&e->cond);
             pthread_mutex_unlock(&e->lock);
