@@ -1,0 +1,2 @@
+http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4
+http://httpbin.org/image/jpeg
